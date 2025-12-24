@@ -1741,6 +1741,619 @@ const commandsModule = ({
     },
 
     /**
+     * Run fully automatic nnUNet segmentation without user prompts
+     */
+    async nnunetAutoSegmentation() {
+      if (toolboxState.getLocked()) {
+        return;
+      }
+
+      const start = Date.now();
+      const { activeViewportId, viewports } = viewportGridService.getState();
+      const activeViewportSpecificData = viewports.get(activeViewportId);
+
+      if (activeViewportSpecificData === undefined) {
+        return;
+      }
+
+      const { displaySetInstanceUIDs } = activeViewportSpecificData;
+      const displaySets = displaySetService.activeDisplaySets;
+      const displaySetInstanceUID = displaySetInstanceUIDs[0];
+      let currentDisplaySets;
+      for (let i = 0; i < displaySets.length; i++) {
+        if (displaySets[i].displaySetInstanceUID == displaySetInstanceUID) {
+          currentDisplaySets = displaySets[i];
+          break;
+        }
+      }
+
+      if (currentDisplaySets === undefined || currentDisplaySets.Modality === "SEG") {
+        return;
+      }
+
+      const currentImageIdIndex = servicesManager.services.cornerstoneViewportService
+        .getCornerstoneViewport(activeViewportId)
+        .getCurrentImageIdIndex();
+
+      let url = `/monai/infer/segmentation?image=${currentDisplaySets.SeriesInstanceUID}&output=dicom_seg`;
+      let params = {
+        largest_cc: false,
+        result_extension: '.nii.gz',
+        result_dtype: 'uint16',
+        result_compress: false,
+        studyInstanceUID: currentDisplaySets.StudyInstanceUID,
+        restore_label_idx: false,
+        nninter: "nnunet_auto",
+      };
+
+      let data = MonaiLabelClient.constructFormData(params, null);
+
+      // Create the axios promise
+      const segmentationPromise = axios.post(url, data, {
+        responseType: 'arraybuffer',
+        headers: {
+          accept: 'application/octet-stream',
+        },
+      });
+
+      // Show notification with promise support
+      uiNotificationService.show({
+        title: 'nnUNet Auto Segmentation',
+        message: 'Running fully automatic segmentation...',
+        type: 'info',
+        promise: segmentationPromise,
+        promiseMessages: {
+          loading: 'Running nnUNet auto segmentation...',
+          success: () => 'nnUNet Auto Segmentation - Successful',
+          error: (error) => `nnUNet Auto Segmentation - Failed: ${error.message || 'Unknown error'}`,
+        },
+      });
+
+      try {
+        const response = await segmentationPromise;
+        if (response.status === 200) {
+          const ct = response.headers["content-type"] as string;
+          const { meta, seg } = await parseMultipart(response.data, ct);
+          const flipped = meta.flipped.toLowerCase() === "true";
+          const raw = seg;
+          const new_arrayBuffer = new Uint8Array(raw);
+
+          let imageIds = currentDisplaySets.imageIds;
+          const segmentNumber = 1; // Default segment number for auto segmentation
+          const segmentationId = currentDisplaySets.displaySetInstanceUID;
+
+          // Get existing segments or create new
+          let existingSegments: { [segmentIndex: string]: cstTypes.Segment } = {};
+          let segImageIds = [];
+          const representations = servicesManager.services.segmentationService.getSegmentationRepresentations(activeViewportId);
+
+          for (let i = 0; i < representations.length; i++) {
+            const representation = representations[i];
+            if (representation.segmentationId === segmentationId) {
+              const segmentation = csToolsSegmentation.state.getSegmentation(segmentationId);
+              existingSegments = segmentation.segments;
+              segImageIds = segmentation.representationData.LABELMAP.imageIds;
+            }
+          }
+
+          let merged_derivedImages = [];
+          let z_range = [];
+
+          if (segImageIds.length == 0) {
+            let derivedImages_new = await imageLoader.createAndCacheDerivedLabelmapImages(imageIds);
+            if (flipped) {
+              derivedImages_new.reverse();
+            }
+            for (let i = 0; i < derivedImages_new.length; i++) {
+              const voxelManager = derivedImages_new[i].voxelManager as csTypes.IVoxelManager<number>;
+              let scalarData = voxelManager.getScalarData();
+              const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
+              if (sliceData.some(v => v >= 1)) {
+                voxelManager.setScalarData(sliceData);
+                if (flipped) {
+                  z_range.push(derivedImages_new.length - i - 1);
+                } else {
+                  z_range.push(i);
+                }
+              }
+            }
+            if (flipped) {
+              derivedImages_new.reverse();
+            }
+            merged_derivedImages = derivedImages_new;
+          } else {
+            merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
+            if (flipped) {
+              merged_derivedImages.reverse();
+            }
+            for (let i = 0; i < merged_derivedImages.length; i++) {
+              const voxelManager = merged_derivedImages[i].voxelManager as csTypes.IVoxelManager<number>;
+              let scalarData = voxelManager.getScalarData();
+              const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
+              if (sliceData.some(v => v >= 1)) {
+                voxelManager.setScalarData(sliceData);
+                if (flipped) {
+                  z_range.push(merged_derivedImages.length - i - 1);
+                } else {
+                  z_range.push(i);
+                }
+              }
+            }
+            if (flipped) {
+              merged_derivedImages.reverse();
+            }
+          }
+
+          const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+
+          // Parse label information from metadata if available
+          let labels = {};
+          try {
+            if (meta.labels) {
+              labels = JSON.parse(meta.labels);
+            }
+          } catch (e) {
+            console.log('No label metadata available');
+          }
+
+          // Create segments from labels or use default
+          let segments: { [segmentIndex: string]: cstTypes.Segment } = { ...existingSegments };
+          const labelKeys = Object.keys(labels);
+          if (labelKeys.length > 0) {
+            for (const key of labelKeys) {
+              const segIdx = parseInt(key);
+              if (segIdx > 0) {
+                segments[segIdx] = {
+                  segmentIndex: segIdx,
+                  label: labels[key] || `Segment ${segIdx}`,
+                  locked: false,
+                  cachedStats: {},
+                  active: segIdx === 1,
+                };
+              }
+            }
+          } else {
+            segments[segmentNumber] = {
+              segmentIndex: segmentNumber,
+              label: 'nnUNet Auto Segment',
+              locked: false,
+              cachedStats: {},
+              active: true,
+            };
+          }
+
+          // Add or update segmentation
+          if (Object.keys(existingSegments).length === 0) {
+            await csToolsSegmentation.addSegmentations([
+              {
+                segmentationId,
+                representation: {
+                  type: LABELMAP,
+                  data: {
+                    imageIds: derivedImageIds,
+                    referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
+                    referencedImageIds: imageIds,
+                  },
+                },
+                config: { segments },
+              },
+            ]);
+          } else {
+            csToolsSegmentation.updateSegmentations([
+              {
+                segmentationId,
+                payload: {
+                  segments: segments,
+                  representationData: {
+                    [LABELMAP]: {
+                      imageIds: derivedImageIds,
+                      referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
+                      referencedImageIds: imageIds,
+                    }
+                  }
+                },
+              },
+            ]);
+          }
+
+          servicesManager.services.segmentationService.setActiveSegment(segmentationId, segmentNumber);
+          await servicesManager.services.segmentationService.addSegmentationRepresentation(activeViewportId, {
+            segmentationId: segmentationId,
+          });
+
+          // semi-hack: to render segmentation properly on the current image
+          let somewhereIndex = 0;
+          if (currentImageIdIndex === 0) {
+            somewhereIndex = 1;
+          }
+          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+
+          // Recover the visibility of the segments
+          for (let i = 0; i < representations.length; i++) {
+            const representation = representations[i];
+            const repSegments = Object.values(representation.segments);
+            if (repSegments.length > 0) {
+              for (let j = 0; j < repSegments.length; j++) {
+                const segment = repSegments[j];
+                servicesManager.services.segmentationService.setSegmentVisibility(activeViewportId, representation.segmentationId, segment.segmentIndex, segment.visible);
+              }
+            }
+          }
+
+          const end = Date.now();
+          console.log(`nnUNet Auto Segmentation - Time taken: ${(end - start)/1000} Seconds`);
+          return response;
+        }
+      } catch (error) {
+        console.error('nnUNet Auto Segmentation error:', error);
+        throw error;
+      }
+    },
+
+    /**
+     * Run nnUNet auto segmentation and initialize nnInteractive session for refinement.
+     * This displays the initial nnUNet segmentation and sets up the session for interactive refinement.
+     * The nnUNet prediction is used as the initial_seg for interactive refinement.
+     */
+    async nnunetInitForInteractive() {
+      if (toolboxState.getLocked()) {
+        return;
+      }
+
+      const start = Date.now();
+      const { activeViewportId, viewports } = viewportGridService.getState();
+      const activeViewportSpecificData = viewports.get(activeViewportId);
+
+      if (activeViewportSpecificData === undefined) {
+        return;
+      }
+
+      const { displaySetInstanceUIDs } = activeViewportSpecificData;
+      const displaySets = displaySetService.activeDisplaySets;
+      const displaySetInstanceUID = displaySetInstanceUIDs[0];
+      let currentDisplaySets;
+      for (let i = 0; i < displaySets.length; i++) {
+        if (displaySets[i].displaySetInstanceUID == displaySetInstanceUID) {
+          currentDisplaySets = displaySets[i];
+          break;
+        }
+      }
+
+      if (currentDisplaySets === undefined || currentDisplaySets.Modality === "SEG") {
+        return;
+      }
+
+      const currentImageIdIndex = servicesManager.services.cornerstoneViewportService
+        .getCornerstoneViewport(activeViewportId)
+        .getCurrentImageIdIndex();
+
+      let url = `/monai/infer/segmentation?image=${currentDisplaySets.SeriesInstanceUID}&output=dicom_seg`;
+      let params = {
+        largest_cc: false,
+        result_extension: '.nii.gz',
+        result_dtype: 'uint16',
+        result_compress: false,
+        studyInstanceUID: currentDisplaySets.StudyInstanceUID,
+        restore_label_idx: false,
+        nninter: "nnunet_init",  // Initialize nnInteractive with nnUNet prediction
+      };
+
+      let data = MonaiLabelClient.constructFormData(params, null);
+
+      // Create the axios promise
+      const segmentationPromise = axios.post(url, data, {
+        responseType: 'arraybuffer',
+        headers: {
+          accept: 'application/octet-stream',
+        },
+      });
+
+      // Show notification with promise support
+      uiNotificationService.show({
+        title: 'nnUNet + Interactive Init',
+        message: 'Running auto segmentation and preparing for interactive refinement...',
+        type: 'info',
+        promise: segmentationPromise,
+        promiseMessages: {
+          loading: 'Running nnUNet auto segmentation and initializing interactive session...',
+          success: () => 'Ready! Add prompts and click Run to refine the segmentation',
+          error: (error) => `nnUNet Init for Interactive - Failed: ${error.message || 'Unknown error'}`,
+        },
+      });
+
+      try {
+        const response = await segmentationPromise;
+        if (response.status === 200) {
+          const ct = response.headers["content-type"] as string;
+          const { meta, seg } = await parseMultipart(response.data, ct);
+          const flipped = meta.flipped.toLowerCase() === "true";
+          const raw = seg;
+          const new_arrayBuffer = new Uint8Array(raw);
+
+          let imageIds = currentDisplaySets.imageIds;
+          const segmentNumber = 1;
+          
+          // Check for existing active segmentation to use the same ID
+          const activeSegmentation = servicesManager.services.segmentationService.getActiveSegmentation(activeViewportId);
+          let segmentationId: string;
+          let existingSegments: { [segmentIndex: string]: cstTypes.Segment } = {};
+          let segImageIds = [];
+          
+          if (activeSegmentation !== undefined) {
+            // Use existing segmentation
+            segmentationId = activeSegmentation.segmentationId;
+            existingSegments = activeSegmentation.segments || {};
+            segImageIds = activeSegmentation.representationData?.Labelmap?.imageIds || [];
+          } else {
+            // Create new segmentation with a UUID
+            segmentationId = `${csUtils.uuidv4()}`;
+          }
+
+          let merged_derivedImages = [];
+          let z_range = [];
+
+          if (segImageIds.length == 0) {
+            let derivedImages_new = await imageLoader.createAndCacheDerivedLabelmapImages(imageIds);
+            if (flipped) {
+              derivedImages_new.reverse();
+            }
+            for (let i = 0; i < derivedImages_new.length; i++) {
+              const voxelManager = derivedImages_new[i].voxelManager as csTypes.IVoxelManager<number>;
+              let scalarData = voxelManager.getScalarData();
+              const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
+              // Map non-zero values to segmentNumber
+              const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
+              if (sliceData.some(v => v >= 1)) {
+                voxelManager.setScalarData(mappedSliceData);
+                if (flipped) {
+                  z_range.push(derivedImages_new.length - i - 1);
+                } else {
+                  z_range.push(i);
+                }
+              }
+            }
+            if (flipped) {
+              derivedImages_new.reverse();
+            }
+            merged_derivedImages = derivedImages_new;
+          } else {
+            merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
+            if (flipped) {
+              merged_derivedImages.reverse();
+            }
+            for (let i = 0; i < merged_derivedImages.length; i++) {
+              const voxelManager = merged_derivedImages[i].voxelManager as csTypes.IVoxelManager<number>;
+              let scalarData = voxelManager.getScalarData();
+              const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
+              // Map non-zero values to segmentNumber
+              const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
+              if (sliceData.some(v => v >= 1)) {
+                voxelManager.setScalarData(mappedSliceData);
+                if (flipped) {
+                  z_range.push(merged_derivedImages.length - i - 1);
+                } else {
+                  z_range.push(i);
+                }
+              }
+            }
+            if (flipped) {
+              merged_derivedImages.reverse();
+            }
+          }
+
+          const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+
+          // Create segment configuration
+          let segments: { [segmentIndex: string]: cstTypes.Segment } = { ...existingSegments };
+          segments[segmentNumber] = {
+            segmentIndex: segmentNumber,
+            label: 'nnUNet + Interactive',
+            locked: false,
+            cachedStats: {
+              algorithmType: currentDisplaySets.SeriesInstanceUID,  // Used by nninter to match
+            },
+            active: true,
+          };
+
+          // Add or update segmentation
+          if (Object.keys(existingSegments).length === 0) {
+            await csToolsSegmentation.addSegmentations([
+              {
+                segmentationId,
+                representation: {
+                  type: LABELMAP,
+                  data: {
+                    imageIds: derivedImageIds,
+                    referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
+                    referencedImageIds: imageIds,
+                  },
+                },
+                config: { segments },
+              },
+            ]);
+          } else {
+            csToolsSegmentation.updateSegmentations([
+              {
+                segmentationId,
+                payload: {
+                  segments: segments,
+                  representationData: {
+                    [LABELMAP]: {
+                      imageIds: derivedImageIds,
+                      referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
+                      referencedImageIds: imageIds,
+                    }
+                  }
+                },
+              },
+            ]);
+          }
+
+          servicesManager.services.segmentationService.setActiveSegment(segmentationId, segmentNumber);
+          await servicesManager.services.segmentationService.addSegmentationRepresentation(activeViewportId, {
+            segmentationId: segmentationId,
+          });
+
+          // Force re-render to show segmentation properly
+          let somewhereIndex = 0;
+          if (currentImageIdIndex === 0) {
+            somewhereIndex = 1;
+          }
+          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+
+          const end = Date.now();
+          console.log(`nnUNet Init for Interactive - Time taken: ${(end - start)/1000} Seconds`);
+          console.log('nnInteractive session initialized with nnUNet prediction');
+          console.log('Add positive/negative prompts and run nninter to refine the segmentation');
+          
+          return response;
+        }
+      } catch (error) {
+        console.error('nnUNet Init for Interactive error:', error);
+        throw error;
+      }
+    },
+
+    /**
+     * Calculate volumetric metrics for the current segmentation.
+     * Returns volume, surface area, and other metrics for each segment.
+     */
+    async calculateVolumetrics() {
+      const { activeViewportId, viewports } = viewportGridService.getState();
+      const activeViewportSpecificData = viewports.get(activeViewportId);
+
+      if (activeViewportSpecificData === undefined) {
+        uiNotificationService.show({
+          title: 'Volumetric Report',
+          message: 'No active viewport found',
+          type: 'error',
+          duration: 3000,
+        });
+        return;
+      }
+
+      const { displaySetInstanceUIDs } = activeViewportSpecificData;
+      const displaySets = displaySetService.activeDisplaySets;
+      const displaySetInstanceUID = displaySetInstanceUIDs[0];
+      let currentDisplaySets;
+      for (let i = 0; i < displaySets.length; i++) {
+        if (displaySets[i].displaySetInstanceUID == displaySetInstanceUID) {
+          currentDisplaySets = displaySets[i];
+          break;
+        }
+      }
+
+      if (currentDisplaySets === undefined) {
+        return;
+      }
+
+      const url = `/monai/volumetrics/calculate`;
+      const formData = new FormData();
+      formData.append('series_instance_uid', currentDisplaySets.SeriesInstanceUID);
+      formData.append('calculate_surface_area', 'true');
+      formData.append('labels', '{}');
+
+      try {
+        const response = await axios.post(url, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        });
+
+        if (response.status === 200) {
+          const report = response.data;
+          
+          // Format the report for display
+          let message = `Total Volume: ${report.total_volume_ml.toFixed(2)} ml\n\n`;
+          
+          for (const segment of report.segments) {
+            message += `${segment.segment_label}:\n`;
+            message += `  Volume: ${segment.volume_ml.toFixed(2)} ml (${segment.volume_cc.toFixed(2)} cc)\n`;
+            message += `  Voxels: ${segment.voxel_count.toLocaleString()}\n`;
+            if (segment.surface_area_mm2) {
+              message += `  Surface Area: ${segment.surface_area_mm2.toFixed(2)} mm²\n`;
+            }
+            if (segment.sphericity) {
+              message += `  Sphericity: ${(segment.sphericity * 100).toFixed(1)}%\n`;
+            }
+            message += '\n';
+          }
+
+          // Show the report in a modal or notification
+          uiNotificationService.show({
+            title: 'Volumetric Report',
+            message: message,
+            type: 'info',
+            duration: 15000,
+          });
+
+          console.log('Volumetric Report:', report);
+          return report;
+        }
+      } catch (error: any) {
+        const errorMessage = error.response?.data?.detail || error.message || 'Unknown error';
+        uiNotificationService.show({
+          title: 'Volumetric Report Failed',
+          message: errorMessage,
+          type: 'error',
+          duration: 5000,
+        });
+        console.error('Volumetric calculation error:', error);
+      }
+    },
+
+    /**
+     * Save the current segmentation to Orthanc as DICOM SEG.
+     * Uses the existing storeSegmentation command from cornerstone-dicom-seg.
+     */
+    async saveSegmentationToOrthanc() {
+      const { activeViewportId } = viewportGridService.getState();
+      
+      const activeSegmentation = servicesManager.services.segmentationService.getActiveSegmentation(activeViewportId);
+      
+      if (!activeSegmentation) {
+        uiNotificationService.show({
+          title: 'Save Segmentation',
+          message: 'No active segmentation found. Run segmentation first.',
+          type: 'warning',
+          duration: 4000,
+        });
+        return;
+      }
+
+      try {
+        // Use the existing storeSegmentation command from cornerstone-dicom-seg extension
+        const result = await commandsManager.runCommand('storeSegmentation', {
+          segmentationId: activeSegmentation.segmentationId,
+        });
+
+        if (result) {
+          uiNotificationService.show({
+            title: 'Segmentation Saved',
+            message: 'Segmentation has been saved to Orthanc as DICOM SEG',
+            type: 'success',
+            duration: 4000,
+          });
+        }
+        
+        return result;
+      } catch (error: any) {
+        // User may have cancelled the dialog
+        if (error.message !== 'User cancelled') {
+          uiNotificationService.show({
+            title: 'Save Failed',
+            message: error.message || 'Failed to save segmentation',
+            type: 'error',
+            duration: 5000,
+          });
+        }
+        console.error('Save segmentation error:', error);
+      }
+    },
+
+    /**
      * Toggle viewport overlay (the information panel shown on the four corners
      * of the viewport)
      * @see ViewportOverlay and CustomizableViewportOverlay components
@@ -1878,6 +2491,10 @@ const commandsModule = ({
     nninter: actions.nninter,
     jumpToSegment: actions.jumpToSegment,
     toggleCurrentSegment: actions.toggleCurrentSegment,
+    nnunetAutoSegmentation: actions.nnunetAutoSegmentation,
+    nnunetInitForInteractive: actions.nnunetInitForInteractive,
+    calculateVolumetrics: actions.calculateVolumetrics,
+    saveSegmentationToOrthanc: actions.saveSegmentationToOrthanc,
     updateViewportDisplaySet: actions.updateViewportDisplaySet,
   };
 

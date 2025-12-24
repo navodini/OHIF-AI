@@ -54,10 +54,13 @@ services:
     volumes:
        # Persist data
       - ./monai-label/predictions:/code/predictions
+      # Mount checkpoints directory for nnUNet and other models
+      - ./monai-label/checkpoints:/code/checkpoints
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_VISIBLE_DEVICES=all  # This exposes all GPUs to the container
       - NVIDIA_DRIVER_CAPABILITIES=all
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     #  - NVIDIA_DRIVER_CAPABILITIES=compute,utility  # Required driver capabilities for GPU use
     deploy:
       resources:

@@ -51,6 +51,7 @@ jsonlines
 nltk
 pycocoevalcap
 nninteractive
+nnunetv2
 huggingface_hub
 
 # scipy and scikit-learn latest packages are missing on python 3.8

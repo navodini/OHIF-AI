@@ -607,6 +607,50 @@ const toolbarButtons: Button[] = [
     },
   },
   {
+    id: 'nnunetAuto',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'tool-nninter',
+      label: 'nnUNet Auto',
+      tooltip: 'Run fully automatic nnUNet segmentation',
+      commands: 'nnunetAutoSegmentation',
+    },
+  },
+  {
+    id: 'nnunetInit',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'tool-nninter',
+      label: 'nnUNet + Interactive',
+      tooltip: 'Run nnUNet auto-seg and initialize for interactive refinement',
+      commands: 'nnunetInitForInteractive',
+    },
+  },
+  {
+    id: 'calculateVolume',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'icon-measure-non-target',
+      label: 'Volume Report',
+      tooltip: 'Calculate volumetric metrics for current segmentation',
+      commands: 'calculateVolumetrics',
+    },
+  },
+  {
+    id: 'saveSegmentation',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'icon-transferring',
+      label: 'Save to Orthanc',
+      tooltip: 'Save segmentation to Orthanc as DICOM SEG',
+      commands: 'saveSegmentationToOrthanc',
+    },
+  },
+  {
     id: 'sam2',
     uiType: 'ohif.toolBoxButton',
     props: {
