@@ -4,7 +4,7 @@ const defaultActionIcons = [
   {
     id: 'settings',
     iconName: 'Settings',
-    value: false,
+    value: true,  // Show tabs (Primary/Recent/All) by default for longitudinal comparison
   },
 ] as actionIcon[];
 

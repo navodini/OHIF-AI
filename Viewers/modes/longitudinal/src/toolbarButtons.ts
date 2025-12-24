@@ -633,10 +633,21 @@ const toolbarButtons: Button[] = [
     uiType: 'ohif.toolBoxButton',
     props: {
       type: 'tool',
-      icon: 'icon-measure-non-target',
+      icon: 'info-link',
       label: 'Volume Report',
       tooltip: 'Calculate volumetric metrics for current segmentation',
       commands: 'calculateVolumetrics',
+    },
+  },
+  {
+    id: 'longitudinalVolumetrics',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'tab-linear',
+      label: 'Longitudinal',
+      tooltip: 'Track volume changes over time across multiple studies',
+      commands: 'openLongitudinalVolumetrics',
     },
   },
   {

@@ -240,7 +240,7 @@ const commandsModule = ({
      * @returns {Object|void} Returns the naturalized report if successfully stored,
      * otherwise throws an error.
      */
-    storeSegmentation: async ({ segmentationId, dataSource }) => {
+    storeSegmentation: async ({ segmentationId, dataSource, defaultSeriesDescription }) => {
       const segmentation = segmentationService.getSegmentation(segmentationId);
 
       if (!segmentation) {
@@ -258,6 +258,7 @@ const commandsModule = ({
         servicesManager,
         extensionManager,
         title: 'Store Segmentation',
+        defaultValue: defaultSeriesDescription || label || '',
       });
 
       if (action === PROMPT_RESPONSES.CREATE_REPORT) {

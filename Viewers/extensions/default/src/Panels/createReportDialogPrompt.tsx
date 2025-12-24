@@ -2,6 +2,7 @@ import PROMPT_RESPONSES from '../utils/_shared/PROMPT_RESPONSES';
 
 export default function CreateReportDialogPrompt({
   title = 'Create Report',
+  defaultValue = '',
   extensionManager,
   servicesManager,
 }): Promise<{
@@ -23,6 +24,7 @@ export default function CreateReportDialogPrompt({
       content: ReportDialog,
       contentProps: {
         dataSources: allowMultipleDataSources ? dataSources : undefined,
+        defaultValue: defaultValue || title,
         onSave: async ({ reportName, dataSource: selectedDataSource, series }) => {
           resolve({
             value: reportName,
@@ -39,7 +41,6 @@ export default function CreateReportDialogPrompt({
             dataSourceName: undefined,
           });
         },
-        defaultValue: title,
       },
     });
   });

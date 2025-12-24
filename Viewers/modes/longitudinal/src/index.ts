@@ -11,6 +11,7 @@ const ohif = {
   layout: '@ohif/extension-default.layoutTemplateModule.viewerLayout',
   sopClassHandler: '@ohif/extension-default.sopClassHandlerModule.stack',
   thumbnailList: '@ohif/extension-default.panelModule.seriesList',
+  longitudinalVolumetrics: '@ohif/extension-default.panelModule.longitudinalVolumetrics',
   wsiSopClassHandler:
     '@ohif/extension-cornerstone.sopClassHandlerModule.DicomMicroscopySopClassHandler',
 };
@@ -72,6 +73,7 @@ const extensionDependencies = {
 
 function modeFactory({ modeConfiguration }) {
   let _activatePanelTriggersSubscriptions = [];
+  let _segDisplaySetSubscription = null;
   return {
     // TODO: We're using this as a route segment
     // We should not be.
@@ -82,7 +84,7 @@ function modeFactory({ modeConfiguration }) {
      * Lifecycle hooks
      */
     onModeEnter: function ({ servicesManager, extensionManager, commandsManager }: withAppTypes) {
-      const { measurementService, toolbarService, toolGroupService, customizationService } =
+      const { measurementService, toolbarService, toolGroupService, customizationService, displaySetService, segmentationService, viewportGridService } =
         servicesManager.services;
 
       measurementService.clearMeasurements();
@@ -159,6 +161,7 @@ function modeFactory({ modeConfiguration }) {
         'nnunetAuto',
         'nnunetInit',
         'calculateVolume',
+        'longitudinalVolumetrics',
         'saveSegmentation',
         //'resetNninter',
         //'jumpToSegment',
@@ -176,6 +179,76 @@ function modeFactory({ modeConfiguration }) {
         'Shapes',
       ]);
       toolbarService.createButtonSection('brushToolsSection', ['Brush', 'Eraser', 'Threshold']);
+
+      // Helper function to load and overlay a SEG display set
+      const loadAndOverlaySEG = async (displaySet, delayMs = 1000) => {
+        console.log('Auto-loading DICOM SEG:', displaySet.SeriesDescription);
+        try {
+          // Load the SEG display set
+          await displaySet.load({ headers: {} });
+          
+          // Wait a bit for the viewport to be ready
+          setTimeout(async () => {
+            const { activeViewportId } = viewportGridService.getState();
+            if (activeViewportId && displaySet.referencedDisplaySetInstanceUID) {
+              // Check if the active viewport is showing the referenced display set
+              const viewport = viewportGridService.getState().viewports.get(activeViewportId);
+              if (viewport && viewport.displaySetInstanceUIDs.includes(displaySet.referencedDisplaySetInstanceUID)) {
+                // Add the segmentation representation to the viewport
+                const segmentationId = displaySet.displaySetInstanceUID;
+                try {
+                  await segmentationService.addSegmentationRepresentation(activeViewportId, {
+                    segmentationId,
+                  });
+                  console.log('Segmentation overlaid successfully:', displaySet.SeriesDescription);
+                } catch (e) {
+                  console.log('Segmentation may already be added or viewport not ready:', e.message);
+                }
+              } else {
+                console.log('Viewport not showing referenced display set, skipping overlay');
+              }
+            }
+          }, delayMs);
+        } catch (error) {
+          console.error('Failed to auto-load SEG:', error);
+        }
+      };
+
+      // Auto-load DICOM SEG display sets when they are added
+      // This ensures that saved segmentations are automatically overlaid when reopening the study
+      _segDisplaySetSubscription = displaySetService.subscribe(
+        displaySetService.EVENTS.DISPLAY_SETS_ADDED,
+        async ({ displaySetsAdded }) => {
+          for (const displaySet of displaySetsAdded) {
+            // Check if this is a SEG display set
+            if (displaySet.Modality === 'SEG' && displaySet.load) {
+              await loadAndOverlaySEG(displaySet);
+            }
+          }
+        }
+      );
+
+      // Also check for existing SEG display sets that were added before mode entered
+      // This handles the case when reopening a study with existing SEG files
+      setTimeout(async () => {
+        const allDisplaySets = displaySetService.getActiveDisplaySets();
+        console.log('Checking for existing SEG display sets...', allDisplaySets.length, 'total display sets');
+        for (const displaySet of allDisplaySets) {
+          if (displaySet.Modality === 'SEG' && displaySet.load) {
+            // Check if this SEG is already loaded/represented
+            const existingSegmentations = segmentationService.getSegmentations();
+            const alreadyLoaded = existingSegmentations.some(
+              seg => seg.segmentationId === displaySet.displaySetInstanceUID
+            );
+            if (!alreadyLoaded) {
+              console.log('Found existing SEG that needs loading:', displaySet.SeriesDescription);
+              await loadAndOverlaySEG(displaySet, 500);
+            } else {
+              console.log('SEG already loaded:', displaySet.SeriesDescription);
+            }
+          }
+        }
+      }, 2000); // Wait for viewports to be fully initialized
 
       // // ActivatePanel event trigger for when a segmentation or measurement is added.
       // // Do not force activation so as to respect the state the user may have left the UI in.
@@ -219,6 +292,12 @@ function modeFactory({ modeConfiguration }) {
       _activatePanelTriggersSubscriptions.forEach(sub => sub.unsubscribe());
       _activatePanelTriggersSubscriptions = [];
 
+      // Clean up the SEG display set subscription
+      if (_segDisplaySetSubscription) {
+        _segDisplaySetSubscription.unsubscribe();
+        _segDisplaySetSubscription = null;
+      }
+
       uiDialogService.hideAll();
       uiModalService.hide();
       toolGroupService.destroy();
@@ -254,7 +333,7 @@ function modeFactory({ modeConfiguration }) {
             props: {
               leftPanels: [tracked.thumbnailList],
               leftPanelResizable: true,
-              rightPanels: [cornerstone.segmentation],
+              rightPanels: [cornerstone.segmentation, ohif.longitudinalVolumetrics],
               rightPanelClosed: false,
               rightPanelResizable: true,
               viewports: [

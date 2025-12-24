@@ -2249,6 +2249,7 @@ const commandsModule = ({
         return;
       }
 
+      // First, try to get volumetrics from the backend (for freshly computed segmentations)
       const url = `/monai/volumetrics/calculate`;
       const formData = new FormData();
       formData.append('series_instance_uid', currentDisplaySets.SeriesInstanceUID);
@@ -2293,14 +2294,190 @@ const commandsModule = ({
           return report;
         }
       } catch (error: any) {
-        const errorMessage = error.response?.data?.detail || error.message || 'Unknown error';
-        uiNotificationService.show({
-          title: 'Volumetric Report Failed',
-          message: errorMessage,
-          type: 'error',
-          duration: 5000,
-        });
-        console.error('Volumetric calculation error:', error);
+        // If backend fails (no cached segmentation), try to calculate from loaded DICOM SEG
+        console.log('Backend volumetrics failed, trying frontend calculation...');
+        
+        const activeSegmentation = servicesManager.services.segmentationService.getActiveSegmentation(activeViewportId);
+        
+        if (!activeSegmentation) {
+          uiNotificationService.show({
+            title: 'Volumetric Report',
+            message: 'No segmentation found. Run segmentation or load a DICOM SEG first.',
+            type: 'warning',
+            duration: 5000,
+          });
+          return;
+        }
+        
+        try {
+          // Get the labelmap representation data
+          const representationData = activeSegmentation.representationData;
+          const labelmapData = representationData?.Labelmap;
+          
+          if (!labelmapData) {
+            throw new Error('No labelmap data available');
+          }
+          
+          let segmentCounts: { [key: number]: number } = {};
+          let spacing: number[] = [1, 1, 1];
+          let dimensions: number[] = [0, 0, 0];
+          
+          // Check if this is a volume-based or stack-based (imageIds) labelmap
+          if ('volumeId' in labelmapData && labelmapData.volumeId) {
+            // Volume-based labelmap
+            const labelmapVolume = cache.getVolume(labelmapData.volumeId);
+            
+            if (!labelmapVolume) {
+              throw new Error('Could not find labelmap volume in cache');
+            }
+            
+            const voxelManager = labelmapVolume.voxelManager;
+            dimensions = labelmapVolume.dimensions;
+            spacing = labelmapVolume.spacing;
+            
+            // Get scalar data
+            let scalarData;
+            if (voxelManager && typeof voxelManager.getScalarData === 'function') {
+              scalarData = voxelManager.getScalarData();
+            } else if (labelmapVolume.scalarData) {
+              scalarData = labelmapVolume.scalarData;
+            } else {
+              throw new Error('Could not access scalar data from labelmap volume');
+            }
+            
+            // Count voxels for each segment
+            for (let i = 0; i < scalarData.length; i++) {
+              const value = scalarData[i];
+              if (value > 0) {
+                segmentCounts[value] = (segmentCounts[value] || 0) + 1;
+              }
+            }
+            
+          } else if ('imageIds' in labelmapData && labelmapData.imageIds) {
+            // Stack-based labelmap (e.g., loaded DICOM SEG)
+            const imageIds = labelmapData.imageIds;
+            
+            if (!imageIds || imageIds.length === 0) {
+              throw new Error('No image IDs found in labelmap');
+            }
+            
+            // Get spacing from first image
+            const firstImage = cache.getImage(imageIds[0]);
+            if (firstImage) {
+              // Get row and column spacing from the image
+              const rowSpacing = firstImage.rowPixelSpacing || 1;
+              const colSpacing = firstImage.columnPixelSpacing || 1;
+              // Estimate slice thickness from metadata or use 1mm default
+              const sliceThickness = firstImage.sliceThickness || 1;
+              spacing = [colSpacing, rowSpacing, sliceThickness];
+              dimensions = [firstImage.columns || 0, firstImage.rows || 0, imageIds.length];
+            }
+            
+            // Iterate through all images and count voxels
+            for (const imageId of imageIds) {
+              const image = cache.getImage(imageId);
+              if (!image) continue;
+              
+              const voxelManager = image.voxelManager;
+              let scalarData;
+              
+              if (voxelManager && typeof voxelManager.getScalarData === 'function') {
+                scalarData = voxelManager.getScalarData();
+              } else if (image.getPixelData) {
+                scalarData = image.getPixelData();
+              } else {
+                continue;
+              }
+              
+              // Count voxels for each segment in this slice
+              for (let i = 0; i < scalarData.length; i++) {
+                const value = scalarData[i];
+                if (value > 0) {
+                  segmentCounts[value] = (segmentCounts[value] || 0) + 1;
+                }
+              }
+            }
+          } else {
+            throw new Error('Labelmap has neither volumeId nor imageIds');
+          }
+          
+          // Calculate voxel volume in mm³
+          const voxelVolumeMm3 = spacing[0] * spacing[1] * spacing[2];
+          
+          // Get segment labels from the segmentation
+          const segments = activeSegmentation.segments || {};
+          
+          // Build the report
+          let totalVolumeMl = 0;
+          const segmentReports: any[] = [];
+          
+          for (const [segmentIndex, voxelCount] of Object.entries(segmentCounts)) {
+            const segIdx = parseInt(segmentIndex);
+            const volumeMm3 = voxelCount * voxelVolumeMm3;
+            const volumeMl = volumeMm3 / 1000; // 1 ml = 1000 mm³
+            
+            const segment = segments[segIdx];
+            const label = segment?.label || `Segment ${segIdx}`;
+            
+            segmentReports.push({
+              segment_index: segIdx,
+              segment_label: label,
+              volume_mm3: volumeMm3,
+              volume_ml: volumeMl,
+              volume_cc: volumeMl, // cc and ml are equivalent
+              voxel_count: voxelCount,
+            });
+            
+            totalVolumeMl += volumeMl;
+          }
+          
+          // Sort by segment index
+          segmentReports.sort((a, b) => a.segment_index - b.segment_index);
+          
+          // Format the report for display
+          let message = `Total Volume: ${totalVolumeMl.toFixed(2)} ml\n\n`;
+          message += `Dimensions: ${dimensions[0]} x ${dimensions[1]} x ${dimensions[2]}\n`;
+          message += `Spacing: ${spacing[0].toFixed(2)} x ${spacing[1].toFixed(2)} x ${spacing[2].toFixed(2)} mm\n\n`;
+          
+          for (const segment of segmentReports) {
+            message += `${segment.segment_label}:\n`;
+            message += `  Volume: ${segment.volume_ml.toFixed(2)} ml\n`;
+            message += `  Voxels: ${segment.voxel_count.toLocaleString()}\n`;
+            message += '\n';
+          }
+          
+          // Show the report
+          uiNotificationService.show({
+            title: 'Volumetric Report (from loaded SEG)',
+            message: message,
+            type: 'info',
+            duration: 15000,
+          });
+          
+          console.log('Frontend Volumetric Report:', {
+            total_volume_ml: totalVolumeMl,
+            segments: segmentReports,
+            spacing,
+            dimensions,
+          });
+          
+          return {
+            total_volume_ml: totalVolumeMl,
+            segments: segmentReports,
+            spacing,
+            dimensions,
+            source: 'frontend',
+          };
+          
+        } catch (frontendError: any) {
+          uiNotificationService.show({
+            title: 'Volumetric Report Failed',
+            message: frontendError.message || 'Could not calculate volumetrics',
+            type: 'error',
+            duration: 5000,
+          });
+          console.error('Frontend volumetric calculation error:', frontendError);
+        }
       }
     },
 
@@ -2309,7 +2486,7 @@ const commandsModule = ({
      * Uses the existing storeSegmentation command from cornerstone-dicom-seg.
      */
     async saveSegmentationToOrthanc() {
-      const { activeViewportId } = viewportGridService.getState();
+      const { activeViewportId, viewports } = viewportGridService.getState();
       
       const activeSegmentation = servicesManager.services.segmentationService.getActiveSegmentation(activeViewportId);
       
@@ -2324,33 +2501,133 @@ const commandsModule = ({
       }
 
       try {
-        // Use the existing storeSegmentation command from cornerstone-dicom-seg extension
-        const result = await commandsManager.runCommand('storeSegmentation', {
-          segmentationId: activeSegmentation.segmentationId,
-        });
-
-        if (result) {
-          uiNotificationService.show({
-            title: 'Segmentation Saved',
-            message: 'Segmentation has been saved to Orthanc as DICOM SEG',
-            type: 'success',
-            duration: 4000,
-          });
+        // Get the study date and other identifiers from the active viewport's display set
+        const activeViewport = viewports.get(activeViewportId);
+        let studyDateStr = '';
+        let studyInstanceUID = '';
+        let seriesInstanceUID = '';
+        let seriesNumber = '';
+        
+        if (activeViewport && activeViewport.displaySetInstanceUIDs?.length > 0) {
+          const displaySetUID = activeViewport.displaySetInstanceUIDs[0];
+          const displaySet = displaySetService.getDisplaySetByUID(displaySetUID);
+          
+          if (displaySet) {
+            // Get study and series info for unique identification
+            studyInstanceUID = displaySet.StudyInstanceUID || '';
+            seriesInstanceUID = displaySet.SeriesInstanceUID || '';
+            seriesNumber = displaySet.SeriesNumber || '';
+            
+            const study = DicomMetadataStore.getStudy(studyInstanceUID);
+            
+            // StudyDate is in YYYYMMDD format from DICOM
+            let studyDate = displaySet.StudyDate || study?.StudyDate;
+            
+            if (studyDate) {
+              // Format the date from YYYYMMDD to YYYY-MM-DD for readability
+              if (studyDate.length === 8) {
+                studyDateStr = `${studyDate.slice(0, 4)}-${studyDate.slice(4, 6)}-${studyDate.slice(6, 8)}`;
+              } else {
+                studyDateStr = studyDate;
+              }
+            }
+          }
         }
         
-        return result;
-      } catch (error: any) {
-        // User may have cancelled the dialog
-        if (error.message !== 'User cancelled') {
-          uiNotificationService.show({
-            title: 'Save Failed',
-            message: error.message || 'Failed to save segmentation',
-            type: 'error',
-            duration: 5000,
-          });
+        // Create a series description with unique identifiers:
+        // - Study date for easy visual identification
+        // - Last 4 chars of StudyInstanceUID for uniqueness across time points
+        const segmentationLabel = activeSegmentation.label || 'Segmentation';
+        const studyIdSuffix = studyInstanceUID ? studyInstanceUID.slice(-4) : '';
+        const timestamp = new Date().toISOString().slice(11, 19).replace(/:/g, ''); // HHMMSS
+        
+        let seriesDescription = segmentationLabel;
+        if (studyDateStr) {
+          seriesDescription += ` - ${studyDateStr}`;
         }
+        if (studyIdSuffix) {
+          seriesDescription += ` [${studyIdSuffix}]`;
+        }
+        
+        console.log('Auto-saving segmentation:', {
+          studyDate: studyDateStr,
+          studyInstanceUID,
+          seriesInstanceUID,
+          seriesDescription,
+        });
+        
+        // Generate the DICOM SEG directly without dialog
+        const generatedData = await commandsManager.runCommand('generateSegmentation', {
+          segmentationId: activeSegmentation.segmentationId,
+          options: {
+            SeriesDescription: seriesDescription,
+          },
+        });
+
+        if (!generatedData || !generatedData.dataset) {
+          throw new Error('Error during segmentation generation');
+        }
+
+        const { dataset: naturalizedReport } = generatedData;
+        
+        // Log the generated DICOM SEG UIDs for debugging
+        console.log('Generated DICOM SEG:', {
+          StudyInstanceUID: naturalizedReport.StudyInstanceUID,
+          SeriesInstanceUID: naturalizedReport.SeriesInstanceUID,
+          SOPInstanceUID: naturalizedReport.SOPInstanceUID,
+          SeriesDescription: naturalizedReport.SeriesDescription,
+        });
+        
+        // Get the active data source to store the segmentation
+        const dataSource = extensionManager.getActiveDataSource();
+        let dataSourceConfig = dataSource;
+        
+        // Handle both array and object data source configurations
+        if (dataSourceConfig.store === undefined) {
+          dataSourceConfig = dataSourceConfig[0];
+        }
+        
+        // Store to Orthanc/DICOM server
+        await dataSourceConfig.store.dicom(naturalizedReport);
+        
+        // Add the wado root info and register the instance
+        naturalizedReport.wadoRoot = dataSourceConfig.getConfig().wadoRoot;
+        DicomMetadataStore.addInstances([naturalizedReport], true);
+
+        uiNotificationService.show({
+          title: 'Segmentation Saved',
+          message: `Saved: ${seriesDescription}`,
+          type: 'success',
+          duration: 4000,
+        });
+        
+        return naturalizedReport;
+      } catch (error: any) {
+        uiNotificationService.show({
+          title: 'Save Failed',
+          message: error.message || 'Failed to save segmentation',
+          type: 'error',
+          duration: 5000,
+        });
         console.error('Save segmentation error:', error);
       }
+    },
+
+    /**
+     * Open the Longitudinal Volumetrics panel to view volume changes over time.
+     */
+    openLongitudinalVolumetrics() {
+      const { panelService } = servicesManager.services;
+      
+      // Toggle the longitudinal volumetrics panel
+      panelService.activatePanel('@ohif/extension-default.panelModule.longitudinalVolumetrics');
+      
+      uiNotificationService.show({
+        title: 'Longitudinal Volumetrics',
+        message: 'Click "Analyze" in the panel to calculate volume changes across timepoints',
+        type: 'info',
+        duration: 4000,
+      });
     },
 
     /**

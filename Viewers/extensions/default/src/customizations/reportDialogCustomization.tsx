@@ -14,15 +14,16 @@ type ReportDialogProps = {
   hide: () => void;
   onSave: (data: { reportName: string; dataSource: string | null; series: string | null }) => void;
   onCancel: () => void;
+  defaultValue?: string;
 };
 
-function ReportDialog({ dataSources, hide, onSave, onCancel }: ReportDialogProps) {
+function ReportDialog({ dataSources, hide, onSave, onCancel, defaultValue = '' }: ReportDialogProps) {
   const { servicesManager } = useSystem();
   const [selectedDataSource, setSelectedDataSource] = useState<string | null>(
     dataSources?.[0]?.value ?? null
   );
   const [selectedSeries, setSelectedSeries] = useState<string | null>(null);
-  const [reportName, setReportName] = useState('');
+  const [reportName, setReportName] = useState(defaultValue);
 
   const { displaySetService } = servicesManager.services;
 

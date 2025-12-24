@@ -148,6 +148,11 @@ export default defineConfig({
       '/dicomweb': {
         target: 'http://localhost:5000',
       },
+      // Proxy for MONAI Label server
+      '/monai': {
+        target: 'http://localhost:8002',
+        changeOrigin: true,
+      },
       // Add conditional proxy based on env vars
       ...(PROXY_TARGET && PROXY_DOMAIN
         ? {

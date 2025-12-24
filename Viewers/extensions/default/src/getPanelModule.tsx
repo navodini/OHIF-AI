@@ -1,5 +1,5 @@
 import React from 'react';
-import { WrappedPanelStudyBrowser } from './Panels';
+import { WrappedPanelStudyBrowser, PanelLongitudinalVolumetrics } from './Panels';
 import i18n from 'i18next';
 
 // TODO:
@@ -22,6 +22,13 @@ function getPanelModule({ commandsManager, extensionManager, servicesManager }) 
           servicesManager={servicesManager}
         />
       ),
+    },
+    {
+      name: 'longitudinalVolumetrics',
+      iconName: 'tab-linear',
+      iconLabel: 'Volumetrics',
+      label: 'Longitudinal Volumetrics',
+      component: PanelLongitudinalVolumetrics,
     },
   ];
 }

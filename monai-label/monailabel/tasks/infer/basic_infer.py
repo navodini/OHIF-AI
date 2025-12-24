@@ -671,7 +671,12 @@ class BasicInferTask(InferTask):
             
             # Add the initial segmentation to nnInteractive
             # This sets up the session so subsequent prompts will refine this segmentation
-            session.add_initial_seg_interaction(initial_seg, run_prediction=False)
+            session.add_initial_seg_interaction(initial_seg, run_prediction=True)
+            
+            # Diagnostic logging for initial_seg
+            logger.info(f"[DIAG] After add_initial_seg_interaction:")
+            logger.info(f"[DIAG]   session.initial_seg exists: {hasattr(session, 'initial_seg') and session.initial_seg is not None if hasattr(session, 'initial_seg') else 'No attr'}")
+            logger.info(f"[DIAG]   session interactions list: {getattr(session, 'interactions', 'No attr')}")
             
             nninter_init_elapsed = time.time() - nninter_init_start
             logger.info(f"nnInteractive initialization latency: {nninter_init_elapsed:.2f} secs")
@@ -1050,6 +1055,12 @@ class BasicInferTask(InferTask):
                             #if z0 < 0 or y0 < 0 or x0 < 0 or z1 > scribbleMask.shape[0] or y1 > scribbleMask.shape[1] or x1 > scribbleMask.shape[2]:
                             #    continue  # Skip out-of-bounds
                             scribbleMask[z0c:z1c, y0c:y1c, x0c:x1c] |= kernel[kz0:kz1, ky0:ky1, kx0:kx1]
+                        
+                        # Diagnostic logging before scribble
+                        logger.info(f"[DIAG] Before add_scribble_interaction:")
+                        logger.info(f"[DIAG]   session.initial_seg exists: {hasattr(session, 'initial_seg') and session.initial_seg is not None if hasattr(session, 'initial_seg') else 'No attr'}")
+                        logger.info(f"[DIAG]   session interactions list: {getattr(session, 'interactions', 'No attr')}")
+                        
                         scribble_start = time.time()
                         if not _safe_interaction(lambda: session.add_scribble_interaction(scribbleMask, include_interaction=True)):
                             return f'/code/predictions/reset.nii.gz', final_result_json

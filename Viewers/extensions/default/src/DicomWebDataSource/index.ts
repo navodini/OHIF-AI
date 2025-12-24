@@ -329,6 +329,67 @@ function createDicomWebApi(dicomWebConfig: DicomWebConfig, servicesManager) {
           await wadoDicomWebClient.storeInstances(options);
         }
       },
+      /**
+       * Delete a DICOM series from the server (Orthanc-specific via DICOMWeb)
+       * @param StudyInstanceUID - The study instance UID
+       * @param SeriesInstanceUID - The series instance UID to delete
+       */
+      deleteSeries: async (StudyInstanceUID: string, SeriesInstanceUID: string) => {
+        try {
+          // For Orthanc, we use the reject endpoint or direct REST API
+          // First try to find and delete via Orthanc REST API
+          const wadoRoot = dicomWebConfig.wadoRoot || '';
+          const baseUrl = wadoRoot.replace('/dicom-web', '');
+          
+          // Query for the series to get the Orthanc ID
+          const headers = getAuthorizationHeader();
+          
+          // Use Orthanc's /tools/find to get the series ID
+          const findResponse = await fetch(`${baseUrl}/tools/find`, {
+            method: 'POST',
+            headers: {
+              ...headers,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              Level: 'Series',
+              Query: {
+                StudyInstanceUID: StudyInstanceUID,
+                SeriesInstanceUID: SeriesInstanceUID,
+              },
+            }),
+          });
+          
+          if (!findResponse.ok) {
+            console.warn('Failed to find series for deletion:', findResponse.statusText);
+            return false;
+          }
+          
+          const seriesIds = await findResponse.json();
+          
+          if (seriesIds && seriesIds.length > 0) {
+            // Delete each found series
+            for (const seriesId of seriesIds) {
+              const deleteResponse = await fetch(`${baseUrl}/series/${seriesId}`, {
+                method: 'DELETE',
+                headers,
+              });
+              
+              if (!deleteResponse.ok) {
+                console.warn(`Failed to delete series ${seriesId}:`, deleteResponse.statusText);
+              } else {
+                console.log(`Successfully deleted series ${seriesId}`);
+              }
+            }
+            return true;
+          }
+          
+          return false;
+        } catch (error) {
+          console.error('Error deleting series:', error);
+          return false;
+        }
+      },
     },
 
     _retrieveSeriesMetadataSync: async (

@@ -32,7 +32,7 @@ const StudyItem = ({
       onKeyDown={() => {}}
       role="button"
       tabIndex={0}
-      defaultValue={isActive ? 'study-item' : undefined}
+      value={isExpanded ? 'study-item' : undefined}
     >
       <AccordionItem value="study-item">
         <AccordionTrigger className={classnames('hover:bg-accent bg-popover group w-full rounded')}>
