@@ -84,7 +84,7 @@ function modeFactory({ modeConfiguration }) {
      * Lifecycle hooks
      */
     onModeEnter: function ({ servicesManager, extensionManager, commandsManager }: withAppTypes) {
-      const { measurementService, toolbarService, toolGroupService, customizationService, displaySetService, segmentationService, viewportGridService } =
+      const { measurementService, toolbarService, toolGroupService, customizationService, displaySetService, segmentationService, viewportGridService, uiNotificationService } =
         servicesManager.services;
 
       measurementService.clearMeasurements();
@@ -181,36 +181,109 @@ function modeFactory({ modeConfiguration }) {
       toolbarService.createButtonSection('brushToolsSection', ['Brush', 'Eraser', 'Threshold']);
 
       // Helper function to load and overlay a SEG display set
-      const loadAndOverlaySEG = async (displaySet, delayMs = 1000) => {
-        console.log('Auto-loading DICOM SEG:', displaySet.SeriesDescription);
+      const loadAndOverlaySEG = async (displaySet, delayMs = 2000) => {
+        console.log('=== Auto-loading DICOM SEG ===');
+        console.log('SEG SeriesDescription:', displaySet.SeriesDescription);
+        console.log('SEG displaySetInstanceUID:', displaySet.displaySetInstanceUID);
+        
         try {
-          // Load the SEG display set
-          await displaySet.load({ headers: {} });
+          const segmentationId = displaySet.displaySetInstanceUID;
           
-          // Wait a bit for the viewport to be ready
-          setTimeout(async () => {
-            const { activeViewportId } = viewportGridService.getState();
-            if (activeViewportId && displaySet.referencedDisplaySetInstanceUID) {
-              // Check if the active viewport is showing the referenced display set
-              const viewport = viewportGridService.getState().viewports.get(activeViewportId);
-              if (viewport && viewport.displaySetInstanceUIDs.includes(displaySet.referencedDisplaySetInstanceUID)) {
-                // Add the segmentation representation to the viewport
-                const segmentationId = displaySet.displaySetInstanceUID;
-                try {
-                  await segmentationService.addSegmentationRepresentation(activeViewportId, {
-                    segmentationId,
-                  });
-                  console.log('Segmentation overlaid successfully:', displaySet.SeriesDescription);
-                } catch (e) {
-                  console.log('Segmentation may already be added or viewport not ready:', e.message);
+          // Check if this SEG is already loaded as a segmentation
+          const existingSegmentations = segmentationService.getSegmentations();
+          console.log('Existing segmentations:', existingSegmentations.map((s: any) => s.segmentationId));
+          
+          const existingSeg = existingSegmentations.find(
+            (seg: any) => seg.segmentationId === segmentationId
+          );
+          
+          if (!existingSeg) {
+            console.log('Segmentation not yet created, loading SEG display set...');
+            // Load the SEG display set - this will create the segmentation
+            try {
+              await (displaySet as any).load({ headers: {} });
+              console.log('SEG load() completed successfully');
+            } catch (loadError) {
+              console.error('SEG load() failed:', loadError);
+              throw loadError;
+            }
+          } else {
+            console.log('Segmentation already exists:', existingSeg.segmentationId);
+          }
+          
+          // Wait for the segmentation to be fully created
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          
+          // Verify the segmentation was created
+          const segmentation = segmentationService.getSegmentation(segmentationId);
+          if (!segmentation) {
+            console.error('Segmentation was not created after load');
+            return;
+          }
+          console.log('Segmentation verified:', segmentation.segmentationId);
+          
+          // Get referenced display set info
+          const referencedDisplaySetUID = (displaySet as any).referencedDisplaySetInstanceUID;
+          const referencedSeriesUID = (displaySet as any).referencedSeriesInstanceUID;
+          console.log('Referenced DisplaySet UID:', referencedDisplaySetUID);
+          console.log('Referenced Series UID:', referencedSeriesUID);
+
+          const { viewports, activeViewportId } = viewportGridService.getState();
+          let overlaidToAnyViewport = false;
+          
+          console.log('Active viewport ID:', activeViewportId);
+          console.log('Total viewports:', viewports.size);
+
+          // First try: Find viewports showing the referenced display set
+          for (const [viewportId, viewport] of viewports.entries()) {
+            console.log(`Viewport ${viewportId} displaySetInstanceUIDs:`, viewport.displaySetInstanceUIDs);
+            
+            if (referencedDisplaySetUID && viewport.displaySetInstanceUIDs.includes(referencedDisplaySetUID)) {
+              try {
+                await segmentationService.addSegmentationRepresentation(viewportId, {
+                  segmentationId,
+                });
+                console.log(`SUCCESS: Segmentation overlaid to viewport ${viewportId}`);
+                overlaidToAnyViewport = true;
+              } catch (e) {
+                const errorMsg = (e as Error).message;
+                console.log(`Overlay attempt result for ${viewportId}:`, errorMsg);
+                if (errorMsg.includes('already') || errorMsg.includes('exist')) {
+                  overlaidToAnyViewport = true;
                 }
-              } else {
-                console.log('Viewport not showing referenced display set, skipping overlay');
               }
             }
-          }, delayMs);
+          }
+
+          // Second try: If no matching viewport found, try the active viewport
+          if (!overlaidToAnyViewport && activeViewportId) {
+            console.log('No matching viewport found, trying active viewport:', activeViewportId);
+            try {
+              await segmentationService.addSegmentationRepresentation(activeViewportId, {
+                segmentationId,
+              });
+              console.log('SUCCESS: Segmentation overlaid to active viewport');
+              overlaidToAnyViewport = true;
+            } catch (e) {
+              console.warn('Failed to overlay to active viewport:', (e as Error).message);
+            }
+          }
+
+          if (!overlaidToAnyViewport) {
+            console.warn('Could not overlay SEG to any viewport');
+          }
         } catch (error) {
-          console.error('Failed to auto-load SEG:', error);
+          const errorMessage = (error as Error).message || 'Unknown error';
+          console.error('Failed to auto-load SEG:', errorMessage);
+          console.error('Full error:', error);
+          
+          // Show notification to user about the loading failure
+          uiNotificationService.show({
+            title: 'Segmentation Load Issue',
+            message: `Could not load saved segmentation "${displaySet.SeriesDescription || 'Unknown'}". ${errorMessage.includes('orthogonal') ? 'Orientation mismatch detected.' : errorMessage}`,
+            type: 'warning',
+            duration: 5000,
+          });
         }
       };
 
@@ -230,25 +303,55 @@ function modeFactory({ modeConfiguration }) {
 
       // Also check for existing SEG display sets that were added before mode entered
       // This handles the case when reopening a study with existing SEG files
-      setTimeout(async () => {
+      const loadExistingSEGs = async () => {
         const allDisplaySets = displaySetService.getActiveDisplaySets();
-        console.log('Checking for existing SEG display sets...', allDisplaySets.length, 'total display sets');
-        for (const displaySet of allDisplaySets) {
-          if (displaySet.Modality === 'SEG' && displaySet.load) {
-            // Check if this SEG is already loaded/represented
-            const existingSegmentations = segmentationService.getSegmentations();
-            const alreadyLoaded = existingSegmentations.some(
-              seg => seg.segmentationId === displaySet.displaySetInstanceUID
-            );
-            if (!alreadyLoaded) {
-              console.log('Found existing SEG that needs loading:', displaySet.SeriesDescription);
-              await loadAndOverlaySEG(displaySet, 500);
-            } else {
-              console.log('SEG already loaded:', displaySet.SeriesDescription);
-            }
-          }
+        
+        // Log ALL display sets to see what's available
+        console.log('=== All Display Sets ===');
+        allDisplaySets.forEach((ds: any, index: number) => {
+          console.log(`Display Set ${index}:`, {
+            Modality: ds.Modality,
+            SeriesDescription: ds.SeriesDescription,
+            SeriesInstanceUID: ds.SeriesInstanceUID,
+            displaySetInstanceUID: ds.displaySetInstanceUID,
+            SOPClassUID: ds.SOPClassUID,
+            hasLoad: !!ds.load,
+          });
+        });
+        
+        const segDisplaySets = allDisplaySets.filter((ds: any) => ds.Modality === 'SEG');
+        
+        console.log(`Found ${segDisplaySets.length} SEG display set(s) in ${allDisplaySets.length} total display sets`);
+        
+        if (segDisplaySets.length === 0) {
+          console.log('No SEG display sets found. Check if SEG series exists in Orthanc and is being retrieved.');
+          return;
         }
-      }, 2000); // Wait for viewports to be fully initialized
+
+        // Wait for viewports to be ready
+        const { viewports } = viewportGridService.getState();
+        if (viewports.size === 0) {
+          console.log('No viewports ready yet, retrying in 1 second...');
+          setTimeout(loadExistingSEGs, 1000);
+          return;
+        }
+        
+        for (const displaySet of segDisplaySets) {
+          const dsAny = displaySet as any;
+          console.log('Processing existing SEG:', {
+            SeriesDescription: displaySet.SeriesDescription,
+            SeriesInstanceUID: displaySet.SeriesInstanceUID,
+            referencedSeriesInstanceUID: dsAny.referencedSeriesInstanceUID,
+            referencedDisplaySetInstanceUID: dsAny.referencedDisplaySetInstanceUID,
+          });
+          
+          // loadAndOverlaySEG will check if already loaded internally
+          await loadAndOverlaySEG(displaySet, 500);
+        }
+      };
+      
+      // Initial delay to let the viewer initialize, then start checking
+      setTimeout(loadExistingSEGs, 3000);
 
       // // ActivatePanel event trigger for when a segmentation or measurement is added.
       // // Do not force activation so as to respect the state the user may have left the UI in.

@@ -217,6 +217,12 @@ function PanelStudyBrowser({
   useEffect(() => {
     const currentDisplaySets = displaySetService.activeDisplaySets;
 
+    // DEBUG: Log all active display sets and their modalities
+    console.log('[PanelStudyBrowser] Active display sets:', currentDisplaySets.length);
+    currentDisplaySets.forEach((ds, i) => {
+      console.log(`[PanelStudyBrowser] DS ${i}: Modality=${ds.Modality}, excludeFromThumbnail=${ds.excludeFromThumbnailBrowser}, SeriesDesc=${ds.SeriesDescription}`);
+    });
+
     if (!currentDisplaySets.length) {
       return;
     }
@@ -227,6 +233,12 @@ function PanelStudyBrowser({
       thumbnailImageSrcMap,
       viewports
     );
+
+    // DEBUG: Log mapped display sets
+    console.log('[PanelStudyBrowser] Mapped display sets:', mappedDisplaySets.length);
+    mappedDisplaySets.forEach((ds, i) => {
+      console.log(`[PanelStudyBrowser] Mapped DS ${i}: modality=${ds.modality}, componentType=${ds.componentType}`);
+    });
 
     if (!customMapDisplaySets) {
       sortStudyInstances(mappedDisplaySets);

@@ -913,16 +913,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map(v => v === 1 ? segmentNumber : v));
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              derivedImages_new.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
             merged_derivedImages = derivedImages_new
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -942,11 +937,7 @@ const commandsModule = ({
               }
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map((v, idx) => v === 1 ? segmentNumber : scalarData[idx]));
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                z_range.push(flipped ? imgLength - 1 - i : i);
               }
             }
             if(flipped){
@@ -1557,16 +1548,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map(v => v === 1 ? segmentNumber : v));
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              derivedImages_new.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
             merged_derivedImages = derivedImages_new
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -1586,17 +1572,11 @@ const commandsModule = ({
               }
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map((v, idx) => v === 1 ? segmentNumber : scalarData[idx]));
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              merged_derivedImages.reverse();
-            }
-
+            // Don't reverse back - data order now matches referencedImageId order
           }
           
         }
@@ -1850,16 +1830,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(sliceData);
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              derivedImages_new.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
             merged_derivedImages = derivedImages_new;
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -1872,16 +1847,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(sliceData);
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              merged_derivedImages.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
           }
 
           const derivedImageIds = merged_derivedImages.map(image => image.imageId);
@@ -2106,16 +2076,11 @@ const commandsModule = ({
               const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(mappedSliceData);
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              derivedImages_new.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
             merged_derivedImages = derivedImages_new;
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -2130,16 +2095,11 @@ const commandsModule = ({
               const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(mappedSliceData);
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // Use simple index - after reverse, data order matches reference order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              merged_derivedImages.reverse();
-            }
+            // Don't reverse back - data order now matches referencedImageId order
           }
 
           const derivedImageIds = merged_derivedImages.map(image => image.imageId);

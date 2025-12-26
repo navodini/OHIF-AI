@@ -86,6 +86,12 @@ export default function PanelStudyBrowserTracking({
     thumbnailImageSrcMap,
     viewports
   ) => {
+    // DEBUG: Log input display sets
+    console.log('[PanelStudyBrowserTracking] Input display sets:', displaySets.length);
+    displaySets.forEach((ds, i) => {
+      console.log(`[PanelStudyBrowserTracking] Input DS ${i}: Modality=${ds.Modality}, excludeFromThumbnail=${ds.excludeFromThumbnailBrowser}`);
+    });
+
     const thumbnailDisplaySets = [];
     const thumbnailNoImageDisplaySets = [];
     displaySets
@@ -93,6 +99,9 @@ export default function PanelStudyBrowserTracking({
       .forEach(ds => {
         const { thumbnailSrc, displaySetInstanceUID } = ds;
         const componentType = getComponentType(ds);
+
+        // DEBUG: Log each display set being processed
+        console.log(`[PanelStudyBrowserTracking] Processing: Modality=${ds.Modality}, componentType=${componentType}`);
 
         const array =
           componentType === 'thumbnailTracked' ? thumbnailDisplaySets : thumbnailNoImageDisplaySets;
@@ -121,7 +130,13 @@ export default function PanelStudyBrowserTracking({
         });
       });
 
-    return [...thumbnailDisplaySets, ...thumbnailNoImageDisplaySets];
+    const result = [...thumbnailDisplaySets, ...thumbnailNoImageDisplaySets];
+    // DEBUG: Log result
+    console.log(`[PanelStudyBrowserTracking] Returning ${result.length} display sets (${thumbnailDisplaySets.length} tracked, ${thumbnailNoImageDisplaySets.length} noImage)`);
+    result.forEach((ds, i) => {
+      console.log(`[PanelStudyBrowserTracking] Result DS ${i}: modality=${ds.modality}, componentType=${ds.componentType}`);
+    });
+    return result;
   };
 
   // Override component type to use tracking specific components

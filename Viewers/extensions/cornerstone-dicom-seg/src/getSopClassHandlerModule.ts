@@ -17,6 +17,15 @@ function _getDisplaySetsFromSeries(
 ) {
   const instance = instances[0];
 
+  // DEBUG: Log SEG display set creation
+  console.log('[SEG getSopClassHandler] Creating display set from SEG series');
+  console.log('[SEG getSopClassHandler] Instance:', {
+    StudyInstanceUID: instance.StudyInstanceUID,
+    SeriesInstanceUID: instance.SeriesInstanceUID,
+    SOPInstanceUID: instance.SOPInstanceUID,
+    SeriesDescription: instance.SeriesDescription,
+  });
+
   const {
     StudyInstanceUID,
     SeriesInstanceUID,
@@ -99,6 +108,16 @@ function _getDisplaySetsFromSeries(
 
   displaySet.load = async ({ headers }) =>
     await _load(displaySet, servicesManager, extensionManager, headers);
+
+  // DEBUG: Log successful display set creation
+  console.log('[SEG getSopClassHandler] Successfully created SEG display set:', {
+    displaySetInstanceUID: displaySet.displaySetInstanceUID,
+    SeriesDescription: displaySet.SeriesDescription,
+    SeriesInstanceUID: displaySet.SeriesInstanceUID,
+    referencedSeriesInstanceUID: displaySet.referencedSeriesInstanceUID,
+    referencedDisplaySetInstanceUID: displaySet.referencedDisplaySetInstanceUID,
+    excludeFromThumbnailBrowser: displaySet.excludeFromThumbnailBrowser,
+  });
 
   return [displaySet];
 }
@@ -185,8 +204,10 @@ async function _loadSegments({
     imageIds = images.map(image => image.imageId);
   }
 
-  // Todo: what should be defaults here
-  const tolerance = 0.001;
+  // Use a larger tolerance to handle floating-point precision differences
+  // between DICOM SEG creation and loading. The default 0.001 is too strict
+  // for some cases where orientation values have minor precision differences.
+  const tolerance = 0.01;
   eventTarget.addEventListener(Enums.Events.SEGMENTATION_LOAD_PROGRESS, evt => {
     const { percentComplete } = evt.detail;
     segmentationService._broadcastEvent(segmentationService.EVENTS.SEGMENT_LOADING_COMPLETE, {
