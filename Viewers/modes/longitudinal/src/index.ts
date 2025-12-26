@@ -182,7 +182,14 @@ function modeFactory({ modeConfiguration }) {
 
       // Helper function to load and overlay a SEG display set
       const loadAndOverlaySEG = async (displaySet, delayMs = 1000) => {
-        console.log('Auto-loading DICOM SEG:', displaySet.SeriesDescription);
+        console.log('[SEG Auto-Load] Loading DICOM SEG:', displaySet.SeriesDescription);
+        
+        // Skip if already marked as having a load error (e.g., orientation mismatch)
+        if (displaySet.loadError) {
+          console.log('[SEG Auto-Load] Skipping SEG with previous load error:', displaySet.loadError);
+          return;
+        }
+        
         try {
           // Load the SEG display set
           await displaySet.load({ headers: {} });
@@ -200,17 +207,23 @@ function modeFactory({ modeConfiguration }) {
                   await segmentationService.addSegmentationRepresentation(activeViewportId, {
                     segmentationId,
                   });
-                  console.log('Segmentation overlaid successfully:', displaySet.SeriesDescription);
+                  console.log('[SEG Auto-Load] Segmentation overlaid successfully:', displaySet.SeriesDescription);
                 } catch (e) {
-                  console.log('Segmentation may already be added or viewport not ready:', e.message);
+                  console.log('[SEG Auto-Load] Segmentation may already be added or viewport not ready:', e.message);
                 }
               } else {
-                console.log('Viewport not showing referenced display set, skipping overlay');
+                console.log('[SEG Auto-Load] Viewport not showing referenced display set, skipping overlay');
               }
             }
           }, delayMs);
         } catch (error) {
-          console.error('Failed to auto-load SEG:', error);
+          const errorMsg = error?.message || String(error);
+          // Don't log orientation mismatch as an error since it's handled gracefully
+          if (errorMsg.includes('orientation mismatch')) {
+            console.log('[SEG Auto-Load] SEG has orientation mismatch, cannot display as overlay:', displaySet.SeriesDescription);
+          } else {
+            console.error('[SEG Auto-Load] Failed to auto-load SEG:', error);
+          }
         }
       };
 
@@ -219,9 +232,18 @@ function modeFactory({ modeConfiguration }) {
       _segDisplaySetSubscription = displaySetService.subscribe(
         displaySetService.EVENTS.DISPLAY_SETS_ADDED,
         async ({ displaySetsAdded }) => {
+          console.log('[SEG Auto-Load] DISPLAY_SETS_ADDED event fired with', displaySetsAdded.length, 'display sets');
           for (const displaySet of displaySetsAdded) {
+            console.log('[SEG Auto-Load] Display set added:', {
+              Modality: displaySet.Modality,
+              SeriesDescription: displaySet.SeriesDescription,
+              hasLoad: !!displaySet.load,
+              isLoaded: displaySet.isLoaded,
+              displaySetInstanceUID: displaySet.displaySetInstanceUID?.substring(0, 16) + '...',
+            });
             // Check if this is a SEG display set
             if (displaySet.Modality === 'SEG' && displaySet.load) {
+              console.log('[SEG Auto-Load] Detected SEG display set, attempting to load...');
               await loadAndOverlaySEG(displaySet);
             }
           }
@@ -232,19 +254,32 @@ function modeFactory({ modeConfiguration }) {
       // This handles the case when reopening a study with existing SEG files
       setTimeout(async () => {
         const allDisplaySets = displaySetService.getActiveDisplaySets();
-        console.log('Checking for existing SEG display sets...', allDisplaySets.length, 'total display sets');
+        console.log('[SEG Auto-Load] Checking for existing SEG display sets...', allDisplaySets.length, 'total display sets');
+        
+        // Log all display sets for debugging
+        allDisplaySets.forEach((ds, idx) => {
+          console.log(`[SEG Auto-Load] DisplaySet ${idx}:`, {
+            Modality: ds.Modality,
+            SeriesDescription: ds.SeriesDescription,
+            hasLoad: !!ds.load,
+            isLoaded: ds.isLoaded,
+            StudyInstanceUID: ds.StudyInstanceUID?.substring(0, 16) + '...',
+          });
+        });
+        
         for (const displaySet of allDisplaySets) {
           if (displaySet.Modality === 'SEG' && displaySet.load) {
             // Check if this SEG is already loaded/represented
             const existingSegmentations = segmentationService.getSegmentations();
+            console.log('[SEG Auto-Load] Existing segmentations:', existingSegmentations.length);
             const alreadyLoaded = existingSegmentations.some(
               seg => seg.segmentationId === displaySet.displaySetInstanceUID
             );
             if (!alreadyLoaded) {
-              console.log('Found existing SEG that needs loading:', displaySet.SeriesDescription);
+              console.log('[SEG Auto-Load] Found existing SEG that needs loading:', displaySet.SeriesDescription);
               await loadAndOverlaySEG(displaySet, 500);
             } else {
-              console.log('SEG already loaded:', displaySet.SeriesDescription);
+              console.log('[SEG Auto-Load] SEG already loaded:', displaySet.SeriesDescription);
             }
           }
         }

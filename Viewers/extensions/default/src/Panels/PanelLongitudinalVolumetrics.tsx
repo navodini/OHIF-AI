@@ -201,6 +201,22 @@ async function calculateVolumetricsForDisplaySet(
     let spacing: number[] = [1, 1, 1];
     let dimensions: number[] = [0, 0, 0];
 
+    // Try to get spacing from the referenced display set (the actual CT/MR images)
+    const referencedDisplaySetUID = (displaySet as any).referencedDisplaySetInstanceUID;
+    if (referencedDisplaySetUID) {
+      const referencedDisplaySet = displaySetService.getDisplaySetByUID(referencedDisplaySetUID) as any;
+      if (referencedDisplaySet?.images?.[0]) {
+        const refImage = referencedDisplaySet.images[0];
+        // Get spacing from referenced image metadata
+        const rowSpacing = refImage.rowPixelSpacing || refImage.PixelSpacing?.[0] || 1;
+        const colSpacing = refImage.columnPixelSpacing || refImage.PixelSpacing?.[1] || 1;
+        // Use SliceThickness for Z spacing (actual thickness of each slice)
+        const zSpacing = refImage.sliceThickness || refImage.SliceThickness || 1;
+        spacing = [colSpacing, rowSpacing, zSpacing];
+        console.log('[Volumetrics] Using spacing from referenced display set:', spacing);
+      }
+    }
+
     if ('volumeId' in labelmapData && labelmapData.volumeId) {
       const labelmapVolume = cache.getVolume(labelmapData.volumeId);
       if (!labelmapVolume) {
@@ -209,7 +225,12 @@ async function calculateVolumetricsForDisplaySet(
 
       const voxelManager = labelmapVolume.voxelManager;
       dimensions = labelmapVolume.dimensions as number[];
-      spacing = labelmapVolume.spacing as number[];
+      
+      // Use labelmap volume spacing if we didn't get it from referenced display set
+      if (spacing[0] === 1 && spacing[1] === 1 && spacing[2] === 1) {
+        spacing = labelmapVolume.spacing as number[];
+      }
+      console.log('[Volumetrics] Volume spacing:', labelmapVolume.spacing, 'Using:', spacing);
 
       let scalarData;
       if (voxelManager && typeof voxelManager.getScalarData === 'function') {
@@ -232,17 +253,22 @@ async function calculateVolumetricsForDisplaySet(
         return null;
       }
 
-      const firstImage = cache.getImage(imageIds[0]);
+      const firstImage = cache.getImage(imageIds[0]) as any;
       if (firstImage) {
-        const rowSpacing = firstImage.rowPixelSpacing || 1;
-        const colSpacing = firstImage.columnPixelSpacing || 1;
-        const sliceThickness = firstImage.sliceThickness || 1;
-        spacing = [colSpacing, rowSpacing, sliceThickness];
+        // Only use image spacing if we didn't get it from referenced display set
+        if (spacing[0] === 1 && spacing[1] === 1 && spacing[2] === 1) {
+          const rowSpacing = firstImage.rowPixelSpacing || 1;
+          const colSpacing = firstImage.columnPixelSpacing || 1;
+          // Use sliceThickness for Z spacing
+          const zSpacing = firstImage.sliceThickness || 1;
+          spacing = [colSpacing, rowSpacing, zSpacing];
+        }
         dimensions = [firstImage.columns || 0, firstImage.rows || 0, imageIds.length];
+        console.log('[Volumetrics] Stack image spacing:', spacing);
       }
 
       for (const imageId of imageIds) {
-        const image = cache.getImage(imageId);
+        const image = cache.getImage(imageId) as any;
         if (!image) continue;
 
         const voxelManager = image.voxelManager;
@@ -272,10 +298,14 @@ async function calculateVolumetricsForDisplaySet(
     let totalVolumeMl = 0;
     const segmentReports: any[] = [];
 
+    console.log('[Volumetrics] Final spacing used:', spacing, '-> Voxel volume:', voxelVolumeMm3, 'mm³');
+
     for (const [segmentIndex, voxelCount] of Object.entries(segmentCounts)) {
       const segIdx = parseInt(segmentIndex);
       const volumeMm3 = (voxelCount as number) * voxelVolumeMm3;
-      const volumeMl = volumeMm3 / 1000;
+      const volumeCm3 = volumeMm3 / 1000; // 1 cm³ = 1000 mm³
+
+      console.log(`[Volumetrics] Segment ${segIdx}: ${voxelCount} voxels × ${voxelVolumeMm3} mm³/voxel = ${volumeMm3} mm³ = ${volumeCm3.toFixed(4)} cm³`);
 
       const segment = segments[segIdx];
       const label = segment?.label || `Segment ${segIdx}`;
@@ -283,11 +313,11 @@ async function calculateVolumetricsForDisplaySet(
       segmentReports.push({
         segmentIndex: segIdx,
         label: label,
-        volumeMl: volumeMl,
+        volumeMl: volumeCm3, // cm³ = ml
         voxelCount: voxelCount,
       });
 
-      totalVolumeMl += volumeMl;
+      totalVolumeMl += volumeCm3;
     }
 
     segmentReports.sort((a, b) => a.segmentIndex - b.segmentIndex);
@@ -414,31 +444,76 @@ function PanelLongitudinalVolumetrics() {
   }, [displaySetService]);
 
   // Load a study's display sets into OHIF
-  const loadStudyDisplaySets = useCallback(async (studyInstanceUID: string) => {
-    console.log('Loading study:', studyInstanceUID);
+  const loadStudyDisplaySets = useCallback(async (studyInstanceUID: string, forceRefresh = false) => {
+    console.log('[Longitudinal] Loading study:', studyInstanceUID, 'forceRefresh:', forceRefresh);
     const dataSource = getDataSource();
     
     if (!dataSource?.retrieve?.series?.metadata) {
-      console.log('Cannot retrieve series metadata');
+      console.log('[Longitudinal] Cannot retrieve series metadata');
       return;
     }
 
     try {
-      // Get series for this study
+      // Clear the metadata cache if forcing refresh (to pick up newly saved SEG files)
+      if (forceRefresh && dataSource?.deleteStudyMetadataPromise) {
+        console.log('[Longitudinal] Clearing metadata cache for study:', studyInstanceUID);
+        dataSource.deleteStudyMetadataPromise(studyInstanceUID);
+      }
+      
+      // First, query the series in this study to see what's available
+      if (dataSource?.query?.series?.search) {
+        try {
+          const seriesList = await dataSource.query.series.search(studyInstanceUID);
+          console.log('[Longitudinal] Series query for study:', studyInstanceUID, 
+            'found', seriesList?.length || 0, 'series');
+          seriesList?.forEach((s: any, idx: number) => {
+            console.log(`[Longitudinal] Series ${idx}:`, {
+              SeriesInstanceUID: s.SeriesInstanceUID,
+              Modality: s.Modality,
+              SeriesDescription: s.SeriesDescription,
+            });
+          });
+        } catch (e) {
+          console.log('[Longitudinal] Series query not available:', e);
+        }
+      }
+      
+      // Get series for this study - this triggers instance loading
       const seriesMetadata = await dataSource.retrieve.series.metadata({
         StudyInstanceUID: studyInstanceUID,
       });
       
-      console.log('Retrieved series metadata:', seriesMetadata?.length || 0, 'series');
+      // Log the series metadata returned
+      const seriesArray = Array.isArray(seriesMetadata) ? seriesMetadata : Object.values(seriesMetadata || {});
+      console.log('[Longitudinal] Retrieved series metadata:', seriesArray.length, 'series');
+      seriesArray.forEach((s: any, idx: number) => {
+        console.log(`[Longitudinal] Loaded series ${idx}:`, {
+          SeriesInstanceUID: s.SeriesInstanceUID,
+          Modality: s.Modality,
+          SeriesDescription: s.SeriesDescription,
+        });
+      });
       
-      // The display sets should now be created by displaySetService
-      // Wait a moment for processing
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Wait longer for display sets to be created (SEG needs referenced series first)
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      // Log what display sets now exist
+      const allDisplaySets = displaySetService.getActiveDisplaySets();
+      const studyDisplaySets = allDisplaySets.filter((ds: any) => ds.StudyInstanceUID === studyInstanceUID);
+      console.log('[Longitudinal] Display sets after loading study:', studyInstanceUID,
+        'total:', studyDisplaySets.length);
+      studyDisplaySets.forEach((ds: any, idx: number) => {
+        console.log(`[Longitudinal] DisplaySet ${idx}:`, {
+          Modality: ds.Modality,
+          SeriesDescription: ds.SeriesDescription,
+          displaySetInstanceUID: ds.displaySetInstanceUID?.substring(0, 8) + '...',
+        });
+      });
       
     } catch (error) {
-      console.error('Error loading study display sets:', error);
+      console.error('[Longitudinal] Error loading study display sets:', error);
     }
-  }, [getDataSource]);
+  }, [getDataSource, displaySetService]);
 
   // Calculate volumetrics for all SEG display sets across ALL patient studies
   const calculateLongitudinalVolumetrics = useCallback(async () => {
@@ -448,7 +523,15 @@ function PanelLongitudinalVolumetrics() {
     try {
       // Step 1: Get all studies for this patient
       const patientStudies = await fetchAllPatientStudies();
-      console.log('Patient has', patientStudies.length, 'studies');
+      console.log('[Longitudinal] Patient has', patientStudies.length, 'studies');
+      patientStudies.forEach((s: any, idx: number) => {
+        console.log(`[Longitudinal] Study ${idx}:`, {
+          studyInstanceUid: s.studyInstanceUid || s.StudyInstanceUID,
+          studyDescription: s.studyDescription || s.StudyDescription,
+          studyDate: s.studyDate || s.StudyDate,
+          modalities: s.modalities || s.ModalitiesInStudy,
+        });
+      });
       
       if (patientStudies.length === 0) {
         uiNotificationService.show({
@@ -462,17 +545,44 @@ function PanelLongitudinalVolumetrics() {
       }
 
       // Step 2: Load display sets for all patient studies
+      // Note: We need to load ALL series for each study, not just check if the study has any display sets
+      // because a study might have MR loaded but not SEG
       setLoadingMessage(`Loading ${patientStudies.length} studies...`);
-      const loadedStudyUIDs = new Set(
-        displaySetService.getActiveDisplaySets().map((ds: any) => ds.StudyInstanceUID)
+      
+      // Get currently loaded study UIDs and their loaded modalities
+      const currentDisplaySets = displaySetService.getActiveDisplaySets();
+      const loadedStudyModalities = new Map<string, Set<string>>();
+      currentDisplaySets.forEach((ds: any) => {
+        const studyUID = ds.StudyInstanceUID;
+        if (!loadedStudyModalities.has(studyUID)) {
+          loadedStudyModalities.set(studyUID, new Set());
+        }
+        loadedStudyModalities.get(studyUID)!.add(ds.Modality);
+      });
+      
+      console.log('[Longitudinal] Currently loaded studies and modalities:', 
+        Array.from(loadedStudyModalities.entries()).map(([uid, mods]) => ({
+          studyUID: uid.substring(0, 20) + '...',
+          modalities: Array.from(mods)
+        }))
       );
       
       for (const study of patientStudies) {
         const studyUID = study.studyInstanceUid || study.StudyInstanceUID;
-        if (studyUID && !loadedStudyUIDs.has(studyUID)) {
-          console.log('Loading additional study:', studyUID);
+        if (!studyUID) continue;
+        
+        // Check if this study has SEG loaded, not just any modality
+        const loadedMods = loadedStudyModalities.get(studyUID);
+        const hasSegLoaded = loadedMods?.has('SEG');
+        
+        // Always try to load studies that don't have SEG loaded
+        // Use forceRefresh=true to clear cache and pick up newly saved SEG files
+        if (!hasSegLoaded) {
+          console.log('[Longitudinal] Loading study (SEG not loaded yet):', studyUID);
           setLoadingMessage(`Loading study ${study.studyDescription || studyUID}...`);
-          await loadStudyDisplaySets(studyUID);
+          await loadStudyDisplaySets(studyUID, true); // forceRefresh=true to clear metadata cache
+        } else {
+          console.log('[Longitudinal] Study already has SEG loaded:', studyUID);
         }
       }
 
@@ -494,26 +604,56 @@ function PanelLongitudinalVolumetrics() {
         return;
       }
 
-      // Filter to use only the most recent SEG per study
-      // This handles cases where multiple SEG versions exist for the same study
+      // Group segmentations by study only to get one segmentation per study (most recent)
+      // This ensures longitudinal tracking uses only the latest segmentation from each timepoint
       const segsByStudy = new Map<string, any[]>();
       for (const seg of segs) {
         const studyUID = seg.StudyInstanceUID;
+        
         if (!segsByStudy.has(studyUID)) {
           segsByStudy.set(studyUID, []);
         }
         segsByStudy.get(studyUID)!.push(seg);
       }
 
-      // For each study, pick the most recent SEG (by SeriesDate/SeriesTime or InstanceCreationDate)
+      console.log('[Longitudinal Filter] Studies with multiple SEGs:', 
+        Array.from(segsByStudy.entries())
+          .filter(([_, segs]) => segs.length > 1)
+          .map(([studyUID, segs]) => ({
+            studyUID: studyUID.substring(0, 20) + '...',
+            count: segs.length,
+            descriptions: segs.map(s => s.SeriesDescription)
+          }))
+      );
+
+      // For each study, pick the most recent SEG based on series description timestamp
       const filteredSegs: any[] = [];
       for (const [studyUID, studySegs] of segsByStudy.entries()) {
         if (studySegs.length === 1) {
           filteredSegs.push(studySegs[0]);
         } else {
-          // Sort by series date/time or instance creation date, most recent first
+          // Sort by series description timestamp (most recent first) then by other criteria
           const sortedSegs = studySegs.sort((a, b) => {
-            // Try SeriesDate + SeriesTime first
+            // Extract timestamp from series description (format: "nnUNet Auto Segmentation - DD/MM/YYYY, HH:MM:SS")
+            const extractTimestamp = (seriesDesc: string) => {
+              const match = seriesDesc.match(/(\d{2}\/\d{2}\/\d{4}), (\d{2}:\d{2}:\d{2})/);
+              if (match) {
+                const [, dateStr, timeStr] = match;
+                const [day, month, year] = dateStr.split('/').map(Number);
+                const [hour, minute, second] = timeStr.split(':').map(Number);
+                return new Date(year, month - 1, day, hour, minute, second).getTime();
+              }
+              return 0;
+            };
+            
+            const aTimestamp = extractTimestamp(a.SeriesDescription || '');
+            const bTimestamp = extractTimestamp(b.SeriesDescription || '');
+            
+            if (aTimestamp && bTimestamp && aTimestamp !== bTimestamp) {
+              return bTimestamp - aTimestamp; // Most recent first
+            }
+            
+            // Fallback: Try SeriesDate + SeriesTime
             const aSeriesDateTime = (a.SeriesDate || '') + (a.SeriesTime || '');
             const bSeriesDateTime = (b.SeriesDate || '') + (b.SeriesTime || '');
             if (aSeriesDateTime && bSeriesDateTime) {
@@ -535,17 +675,21 @@ function PanelLongitudinalVolumetrics() {
             return (b.SeriesInstanceUID || '').localeCompare(a.SeriesInstanceUID || '');
           });
           
-          console.log(`Study ${studyUID} has ${studySegs.length} SEGs, using most recent:`, sortedSegs[0].SeriesDescription);
+          console.log(`Study ${studyUID.substring(0, 20)}... has ${studySegs.length} SEGs, using most recent:`, sortedSegs[0].SeriesDescription || 'Unknown');
+          console.log(`  Rejected:`, sortedSegs.slice(1).map(s => s.SeriesDescription));
           filteredSegs.push(sortedSegs[0]);
         }
       }
-
       segs = filteredSegs;
-      console.log(`Filtered to ${segs.length} SEGs (one per study)`);
+      console.log(`Filtered to ${segs.length} SEGs (one most recent segmentation per study)`);
+      console.log('Final SEGs used:', segs.map(s => ({ 
+        studyUID: s.StudyInstanceUID?.substring(0, 20) + '...',
+        description: s.SeriesDescription 
+      })));
 
       uiNotificationService.show({
         title: 'Longitudinal Volumetrics',
-        message: `Found ${segs.length} segmentation(s) across ${patientStudies.length} studies`,
+        message: `Found ${segs.length} segmentation(s) across ${patientStudies.length} studies (one per study)`,
         type: 'info',
         duration: 3000,
       });
@@ -555,25 +699,53 @@ function PanelLongitudinalVolumetrics() {
       for (let i = 0; i < segs.length; i++) {
         const seg = segs[i];
         setLoadingMessage(`Loading SEG ${i + 1}/${segs.length}: ${seg.SeriesDescription || 'Segmentation'}...`);
+        
+        // Skip if this SEG has a previous load error (e.g., orientation mismatch)
+        if (seg.loadError) {
+          console.log(`[Longitudinal] Skipping SEG with load error: ${seg.SeriesDescription} (${seg.loadError})`);
+          continue;
+        }
+        
         if (seg.load && !seg.isLoaded) {
           try {
             await seg.load({ headers: {} });
             // Wait a bit for segmentation service to register it
             await new Promise(resolve => setTimeout(resolve, 500));
           } catch (e) {
-            console.log('SEG already loaded or error loading:', e);
+            const errorMsg = e?.message || String(e);
+            if (errorMsg.includes('orientation mismatch')) {
+              console.log(`[Longitudinal] SEG orientation mismatch (cannot calculate volume): ${seg.SeriesDescription}`);
+              // Mark for skipping in volumetrics
+              seg.loadError = 'orientation_mismatch';
+            } else {
+              console.log('[Longitudinal] SEG already loaded or error loading:', e);
+            }
           }
         }
+      }
+
+      // Filter out SEGs that failed to load
+      const loadableSegs = segs.filter(seg => !seg.loadError);
+      
+      // Show warning if some SEGs couldn't be loaded
+      const failedSegs = segs.filter(seg => seg.loadError);
+      if (failedSegs.length > 0) {
+        uiNotificationService.show({
+          title: 'Longitudinal Volumetrics',
+          message: `${failedSegs.length} segmentation(s) could not be loaded due to orientation mismatch with source images.`,
+          type: 'warning',
+          duration: 6000,
+        });
       }
 
       // Wait for segmentations to be registered
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // Step 5: Calculate volumetrics for each SEG
+      // Step 5: Calculate volumetrics for each loadable SEG
       setLoadingMessage('Calculating volumes...');
       const timepoints: VolumetricData[] = [];
       
-      for (const seg of segs) {
+      for (const seg of loadableSegs) {
         const volumeData = await calculateVolumetricsForDisplaySet(seg, segmentationService, displaySetService);
         if (volumeData) {
           timepoints.push(volumeData);
@@ -581,9 +753,12 @@ function PanelLongitudinalVolumetrics() {
       }
 
       if (timepoints.length === 0) {
+        const errorMsg = failedSegs.length > 0 
+          ? 'All segmentations have orientation mismatches. The SEG files were saved in a different orientation than the source images.'
+          : 'Could not calculate volumetrics. Please ensure SEG files are loaded.';
         uiNotificationService.show({
           title: 'Longitudinal Volumetrics',
-          message: 'Could not calculate volumetrics. Please ensure SEG files are loaded.',
+          message: errorMsg,
           type: 'warning',
           duration: 5000,
         });
@@ -603,24 +778,75 @@ function PanelLongitudinalVolumetrics() {
       const instances = firstSeg.instances || [];
       const firstInstance = instances[0] || {};
 
+      // Normalize label function for consistent grouping across different segmentation sources
+      // This handles various naming conventions from nnUNet, nnInteractive, and manual segmentations
+      const normalizeLabel = (label: string) => {
+        let normalized = label.trim().toLowerCase();
+        
+        // Remove "background;" prefix
+        normalized = normalized.replace(/^background;?\s*/i, '');
+        
+        // Handle nninter_pred_* patterns -> "segmentation"
+        if (normalized.match(/^nninter_pred_\d+$/)) {
+          return 'segmentation';
+        }
+        
+        // Handle nnunet_init_* patterns -> "segmentation"
+        if (normalized.match(/^nnunet_init_\d+$/)) {
+          return 'segmentation';
+        }
+        
+        // Handle nnunet_auto_pred_* patterns -> "segmentation"
+        if (normalized.match(/^nnunet_auto_pred_\d+$/)) {
+          return 'segmentation';
+        }
+        
+        // Handle "nnunet + interactive" and similar -> "segmentation"
+        if (normalized.includes('nnunet') || normalized.includes('interactive')) {
+          return 'segmentation';
+        }
+        
+        // Handle "segment 1", "segment 2", etc. -> keep as is but normalize
+        const segmentMatch = normalized.match(/segment\s*(\d+)/);
+        if (segmentMatch) {
+          return `segment ${segmentMatch[1]}`;
+        }
+        
+        // Normalize whitespace for anything else
+        return normalized.replace(/\s+/g, ' ').trim();
+      };
+
       // Calculate volume changes between consecutive timepoints
       const volumeChanges: LongitudinalReport['volumeChanges'] = [];
       
-      // Group segments by label across timepoints
-      const segmentLabels = new Set<string>();
+      // Group segments by NORMALIZED label across timepoints
+      const normalizedToOriginal = new Map<string, string>();
       timepoints.forEach(tp => {
-        tp.segments.forEach(seg => segmentLabels.add(seg.label));
+        tp.segments.forEach(seg => {
+          const normalized = normalizeLabel(seg.label);
+          console.log(`[Label Normalization] Original: "${seg.label}" -> Normalized: "${normalized}"`);
+          if (!normalizedToOriginal.has(normalized)) {
+            normalizedToOriginal.set(normalized, seg.label);
+          }
+        });
       });
+      
+      console.log('[Label Normalization] Unique normalized labels:', Array.from(normalizedToOriginal.keys()));
+      console.log('[Label Normalization] Final segment labels:', Array.from(normalizedToOriginal.values()));
+      
+      const segmentLabels = new Set<string>(normalizedToOriginal.values());
 
       for (const label of segmentLabels) {
+        const normalizedLabel = normalizeLabel(label);
         const changes: LongitudinalReport['volumeChanges'][0]['changes'] = [];
         
         for (let i = 1; i < timepoints.length; i++) {
           const prevTp = timepoints[i - 1];
           const currTp = timepoints[i];
           
-          const prevSegment = prevTp.segments.find(s => s.label === label);
-          const currSegment = currTp.segments.find(s => s.label === label);
+          // Find segments by normalized label
+          const prevSegment = prevTp.segments.find(s => normalizeLabel(s.label) === normalizedLabel);
+          const currSegment = currTp.segments.find(s => normalizeLabel(s.label) === normalizedLabel);
           
           if (prevSegment && currSegment) {
             const absoluteChange = currSegment.volumeMl - prevSegment.volumeMl;
@@ -680,7 +906,7 @@ function PanelLongitudinalVolumetrics() {
   const exportToCSV = useCallback(() => {
     if (!report) return;
 
-    let csv = 'Patient ID,Patient Name,Study Date,Series Description,Segment,Volume (ml),Voxel Count\n';
+    let csv = 'Patient ID,Patient Name,Study Date,Series Description,Segment,Volume (cm³),Voxel Count\n';
     
     for (const tp of report.timepoints) {
       for (const seg of tp.segments) {
@@ -690,7 +916,7 @@ function PanelLongitudinalVolumetrics() {
 
     // Add volume changes section
     csv += '\n\nVolume Changes Over Time\n';
-    csv += 'Segment,From Date,To Date,From Volume (ml),To Volume (ml),Absolute Change (ml),Percent Change (%)\n';
+    csv += 'Segment,From Date,To Date,From Volume (cm³),To Volume (cm³),Absolute Change (cm³),Percent Change (%)\n';
     
     for (const vc of report.volumeChanges) {
       for (const change of vc.changes) {
@@ -769,6 +995,287 @@ function PanelLongitudinalVolumetrics() {
     }
   }, [viewportGridService, displaySetService]);
 
+  // Capture a bounding box cropped view of the tumor region on the largest area axial slice
+  const captureTumorBoundingBox = useCallback(async (displaySetInstanceUID: string): Promise<string | null> => {
+    try {
+      const displaySet = displaySetService.getDisplaySetByUID(displaySetInstanceUID) as any;
+      if (!displaySet) {
+        console.log('[TumorCapture] Display set not found:', displaySetInstanceUID);
+        return null;
+      }
+
+      console.log('[TumorCapture] Processing:', displaySet.SeriesDescription);
+
+      // Get the segmentation
+      const segmentationId = displaySet.displaySetInstanceUID;
+      const segmentation = segmentationService.getSegmentation(segmentationId) as any;
+      
+      if (!segmentation) {
+        console.log('[TumorCapture] Segmentation not found, trying to load...');
+        // Try to load the segmentation first
+        if (displaySet.load && !displaySet.isLoaded) {
+          try {
+            await displaySet.load({ headers: {} });
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } catch (e) {
+            console.log('[TumorCapture] Failed to load segmentation');
+          }
+        }
+      }
+
+      // Get labelmap representation
+      const seg = segmentationService.getSegmentation(segmentationId) as any;
+      const labelmapRep = seg?.representationData?.Labelmap as any;
+      
+      // Try to get volume data for bounding box calculation
+      let volumeData: any = null;
+      let dimensions: number[] = [0, 0, 0];
+      let scalarData: any = null;
+      
+      if (labelmapRep?.volumeId) {
+        volumeData = cache.getVolume(labelmapRep.volumeId) as any;
+        if (volumeData) {
+          dimensions = volumeData.dimensions;
+          const voxelManager = volumeData.voxelManager;
+          if (voxelManager && typeof voxelManager.getScalarData === 'function') {
+            scalarData = voxelManager.getScalarData();
+          } else if (volumeData.scalarData) {
+            scalarData = volumeData.scalarData;
+          }
+        }
+      }
+
+      // Find the referenced display set and viewport
+      const referencedUID = displaySet.referencedDisplaySetInstanceUID;
+      const viewportGridState = viewportGridService.getState();
+      const viewports = viewportGridState?.viewports || new Map();
+      
+      let targetViewportId: string | null = null;
+      
+      for (const [viewportId, viewport] of viewports) {
+        const displaySetUIDs = (viewport as any)?.displaySetInstanceUIDs || [];
+        if (displaySetUIDs.includes(referencedUID) || displaySetUIDs.includes(displaySetInstanceUID)) {
+          targetViewportId = viewportId;
+          break;
+        }
+      }
+
+      // If no viewport found, try using the first available viewport
+      if (!targetViewportId) {
+        const viewportIds = Array.from(viewports.keys());
+        if (viewportIds.length > 0) {
+          targetViewportId = viewportIds[0] as string;
+          console.log('[TumorCapture] Using first viewport:', targetViewportId);
+        }
+      }
+
+      if (!targetViewportId) {
+        console.log('[TumorCapture] No viewport available');
+        return null;
+      }
+
+      // If we have volume data, find the largest slice and navigate to it
+      if (volumeData && scalarData && dimensions[0] > 0) {
+        // Find bounding box of segmentation and slice with largest area
+        let minX = dimensions[0], maxX = 0;
+        let minY = dimensions[1], maxY = 0;
+        
+        const sliceAreas: number[] = new Array(dimensions[2]).fill(0);
+        const pixelsPerSlice = dimensions[0] * dimensions[1];
+
+        for (let z = 0; z < dimensions[2]; z++) {
+          for (let y = 0; y < dimensions[1]; y++) {
+            for (let x = 0; x < dimensions[0]; x++) {
+              const idx = z * pixelsPerSlice + y * dimensions[0] + x;
+              if (scalarData[idx] > 0) {
+                minX = Math.min(minX, x);
+                maxX = Math.max(maxX, x);
+                minY = Math.min(minY, y);
+                maxY = Math.max(maxY, y);
+                sliceAreas[z]++;
+              }
+            }
+          }
+        }
+
+        // Find slice with maximum area
+        let maxSliceIndex = 0;
+        let maxArea = 0;
+        for (let z = 0; z < sliceAreas.length; z++) {
+          if (sliceAreas[z] > maxArea) {
+            maxArea = sliceAreas[z];
+            maxSliceIndex = z;
+          }
+        }
+
+        if (maxArea > 0) {
+          console.log(`[TumorCapture] Largest slice: ${maxSliceIndex} with ${maxArea} voxels`);
+          
+          // Navigate to the largest area slice
+          const cornerstoneViewport = cornerstoneViewportService.getCornerstoneViewport(targetViewportId) as any;
+          if (cornerstoneViewport && typeof cornerstoneViewport.setImageIdIndex === 'function') {
+            await cornerstoneViewport.setImageIdIndex(maxSliceIndex);
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+        }
+      }
+
+      // Capture the viewport
+      const viewportElement = document.querySelector(`[data-viewport-uid="${targetViewportId}"]`) as HTMLElement;
+      if (!viewportElement) {
+        console.log('[TumorCapture] Viewport element not found');
+        return null;
+      }
+
+      console.log('[TumorCapture] Capturing viewport...');
+      const fullCanvas = await html2canvas(viewportElement, {
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#000000',
+      });
+
+      // If we have bounding box info, crop the image
+      if (volumeData && scalarData && dimensions[0] > 0) {
+        // Recalculate bounding box for current slice
+        let minX = dimensions[0], maxX = 0;
+        let minY = dimensions[1], maxY = 0;
+        const pixelsPerSlice = dimensions[0] * dimensions[1];
+        
+        for (let z = 0; z < dimensions[2]; z++) {
+          for (let y = 0; y < dimensions[1]; y++) {
+            for (let x = 0; x < dimensions[0]; x++) {
+              const idx = z * pixelsPerSlice + y * dimensions[0] + x;
+              if (scalarData[idx] > 0) {
+                minX = Math.min(minX, x);
+                maxX = Math.max(maxX, x);
+                minY = Math.min(minY, y);
+                maxY = Math.max(maxY, y);
+              }
+            }
+          }
+        }
+
+        if (maxX > minX && maxY > minY) {
+          // Add padding
+          const bboxWidth = maxX - minX;
+          const bboxHeight = maxY - minY;
+          const paddingX = Math.max(20, Math.round(bboxWidth * 0.3));
+          const paddingY = Math.max(20, Math.round(bboxHeight * 0.3));
+          
+          const cropMinX = Math.max(0, minX - paddingX);
+          const cropMaxX = Math.min(dimensions[0] - 1, maxX + paddingX);
+          const cropMinY = Math.max(0, minY - paddingY);
+          const cropMaxY = Math.min(dimensions[1] - 1, maxY + paddingY);
+
+          // Calculate crop coordinates in canvas space
+          const scaleX = fullCanvas.width / dimensions[0];
+          const scaleY = fullCanvas.height / dimensions[1];
+
+          const cropX = Math.round(cropMinX * scaleX);
+          const cropY = Math.round(cropMinY * scaleY);
+          const cropWidth = Math.round((cropMaxX - cropMinX) * scaleX);
+          const cropHeight = Math.round((cropMaxY - cropMinY) * scaleY);
+
+          // Create cropped canvas
+          const croppedCanvas = document.createElement('canvas');
+          croppedCanvas.width = cropWidth;
+          croppedCanvas.height = cropHeight;
+          const ctx = croppedCanvas.getContext('2d');
+          
+          if (ctx && cropWidth > 0 && cropHeight > 0) {
+            ctx.drawImage(fullCanvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+            console.log('[TumorCapture] Cropped image created');
+            return croppedCanvas.toDataURL('image/png');
+          }
+        }
+      }
+
+      // Return full viewport if cropping failed
+      console.log('[TumorCapture] Returning full viewport capture');
+      return fullCanvas.toDataURL('image/png');
+    } catch (error) {
+      console.error('[TumorCapture] Error:', error);
+      return null;
+    }
+  }, [displaySetService, segmentationService, viewportGridService, cornerstoneViewportService]);
+
+  // Generate markdown report
+  const generateMarkdownReport = useCallback((screenshotDataUrls: Map<string, string>): string => {
+    if (!report) return '';
+
+    let md = '# Longitudinal Volumetrics Report\n\n';
+    md += `**Patient ID:** ${report.patientId}\n\n`;
+    md += `**Patient Name:** ${report.patientName}\n\n`;
+    md += `**Report Date:** ${new Date().toLocaleDateString()}\n\n`;
+    md += `**Number of Timepoints:** ${report.timepoints.length}\n\n`;
+    md += '---\n\n';
+
+    // Volume Changes Summary
+    if (report.volumeChanges.length > 0) {
+      md += '## Volume Changes Summary\n\n';
+      
+      for (const vc of report.volumeChanges) {
+        if (!selectedSegments.includes(vc.label)) continue;
+        
+        md += `### ${vc.label}\n\n`;
+        md += '| From Date | To Date | From Volume (cm³) | To Volume (cm³) | Change (cm³) | Change (%) |\n';
+        md += '|-----------|---------|-------------------|-----------------|--------------|------------|\n';
+        
+        for (const change of vc.changes) {
+          const sign = change.percentChange >= 0 ? '+' : '';
+          md += `| ${formatDicomDate(change.fromDate)} | ${formatDicomDate(change.toDate)} | ${change.fromVolume.toFixed(2)} | ${change.toVolume.toFixed(2)} | ${change.absoluteChange.toFixed(2)} | ${sign}${change.percentChange.toFixed(1)}% |\n`;
+        }
+        md += '\n';
+      }
+    }
+
+    // Timepoint Details
+    md += '## Timepoint Details\n\n';
+    
+    for (let i = 0; i < report.timepoints.length; i++) {
+      const tp = report.timepoints[i];
+      
+      md += `### Timepoint ${i + 1}: ${formatDicomDate(tp.studyDate)}\n\n`;
+      md += `**Series:** ${tp.seriesDescription}\n\n`;
+      md += `**Total Volume:** ${tp.totalVolumeMl.toFixed(2)} cm³\n\n`;
+      
+      md += '| Segment | Volume (cm³) | Voxel Count |\n';
+      md += '|---------|--------------|-------------|\n';
+      
+      for (const seg of tp.segments) {
+        if (!selectedSegments.includes(seg.label)) continue;
+        md += `| ${seg.label} | ${seg.volumeMl.toFixed(4)} | ${seg.voxelCount} |\n`;
+      }
+      md += '\n';
+
+      // Add screenshot reference if available
+      if (screenshotDataUrls.has(tp.displaySetInstanceUID)) {
+        md += `![Timepoint ${i + 1} - Largest Area Axial Slice](timepoint_${i + 1}_axial.png)\n\n`;
+      }
+      
+      md += '---\n\n';
+    }
+
+    return md;
+  }, [report, selectedSegments]);
+
+  // Export report as Markdown
+  const exportToMarkdown = useCallback((screenshotDataUrls: Map<string, string>) => {
+    if (!report) return;
+
+    const markdown = generateMarkdownReport(screenshotDataUrls);
+    
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `volumetrics_${report.patientId}_${new Date().toISOString().split('T')[0]}.md`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, [report, generateMarkdownReport]);
+
   // Export report as PDF with viewport captures
   const exportToPDF = useCallback(async () => {
     if (!report) return;
@@ -843,7 +1350,7 @@ function PanelLongitudinalVolumetrics() {
           for (const change of vc.changes) {
             checkPageBreak(6);
             const changeText = `${formatDicomDate(change.fromDate)} → ${formatDicomDate(change.toDate)}: `;
-            const volumeText = `${change.fromVolume.toFixed(2)} ml → ${change.toVolume.toFixed(2)} ml `;
+            const volumeText = `${change.fromVolume.toFixed(2)} cm³ → ${change.toVolume.toFixed(2)} cm³ `;
             const percentText = `(${change.percentChange >= 0 ? '+' : ''}${change.percentChange.toFixed(1)}%)`;
             pdf.text(`  ${changeText}${volumeText}${percentText}`, margin, yPos);
             yPos += 5;
@@ -860,10 +1367,93 @@ function PanelLongitudinalVolumetrics() {
       pdf.text('Timepoint Details', margin, yPos);
       yPos += 10;
 
+      // First, capture all tumor bounding box screenshots
+      // We need to load each segmentation into the viewport before capturing
+      setLoadingMessage('Capturing tumor images for all timepoints...');
+      const allScreenshots: Map<string, string> = new Map();
+      
+      // Get the first viewport ID to use for loading display sets
+      const viewportGridState = viewportGridService.getState();
+      const viewports = viewportGridState?.viewports || new Map();
+      const viewportIds = Array.from(viewports.keys());
+      const targetViewportId = viewportIds[0] as string;
+      
+      for (let i = 0; i < report.timepoints.length; i++) {
+        const tp = report.timepoints[i];
+        setLoadingMessage(`Loading and capturing timepoint ${i + 1}/${report.timepoints.length}...`);
+        
+        try {
+          // Get the SEG display set and its referenced image display set
+          const segDisplaySet = displaySetService.getDisplaySetByUID(tp.displaySetInstanceUID) as any;
+          if (!segDisplaySet) {
+            console.log(`[PDF] SEG display set not found for timepoint ${i + 1}`);
+            continue;
+          }
+          
+          const referencedUID = segDisplaySet.referencedDisplaySetInstanceUID;
+          
+          // Load the referenced image display set into the viewport
+          if (referencedUID && targetViewportId) {
+            try {
+              // Use viewportGridService to set the display sets
+              await viewportGridService.setDisplaySetsForViewport({
+                viewportId: targetViewportId,
+                displaySetInstanceUIDs: [referencedUID],
+              });
+              
+              // Wait for the images to load
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+              // Now add the segmentation overlay
+              // Try to load the segmentation if not already loaded
+              if (segDisplaySet.load && !segDisplaySet.isLoaded) {
+                await segDisplaySet.load({ headers: {} });
+              }
+              
+              // Add segmentation to viewport
+              const segmentationId = segDisplaySet.displaySetInstanceUID;
+              try {
+                await (segmentationService as any).addSegmentationRepresentation(
+                  targetViewportId,
+                  {
+                    segmentationId: segmentationId,
+                    type: 'Labelmap',
+                  }
+                );
+              } catch (segError) {
+                console.log('[PDF] Segmentation may already be added:', segError);
+              }
+              
+              // Wait for segmentation to render
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+            } catch (loadError) {
+              console.log(`[PDF] Error loading display sets for timepoint ${i + 1}:`, loadError);
+            }
+          }
+          
+          // Now capture the screenshot
+          const screenshot = await captureTumorBoundingBox(tp.displaySetInstanceUID);
+          if (screenshot) {
+            allScreenshots.set(tp.displaySetInstanceUID, screenshot);
+            console.log(`[PDF] Captured screenshot for timepoint ${i + 1}`);
+          } else {
+            console.log(`[PDF] Failed to capture screenshot for timepoint ${i + 1}`);
+          }
+          
+        } catch (error) {
+          console.error(`[PDF] Error processing timepoint ${i + 1}:`, error);
+        }
+        
+        // Small delay between captures
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Now add each timepoint with its screenshot
       for (let i = 0; i < report.timepoints.length; i++) {
         const tp = report.timepoints[i];
         
-        checkPageBreak(80);
+        checkPageBreak(100);
         
         // Timepoint header
         pdf.setFontSize(12);
@@ -875,13 +1465,13 @@ function PanelLongitudinalVolumetrics() {
         pdf.setFont('helvetica', 'normal');
         pdf.text(`Series: ${tp.seriesDescription}`, margin, yPos);
         yPos += 5;
-        pdf.text(`Total Volume: ${tp.totalVolumeMl.toFixed(2)} ml`, margin, yPos);
+        pdf.text(`Total Volume: ${tp.totalVolumeMl.toFixed(2)} cm³`, margin, yPos);
         yPos += 6;
 
         // Segment volumes table
         pdf.setFont('helvetica', 'bold');
         pdf.text('Segment', margin, yPos);
-        pdf.text('Volume (ml)', margin + 60, yPos);
+        pdf.text('Volume (cm³)', margin + 60, yPos);
         pdf.text('Voxel Count', margin + 100, yPos);
         yPos += 5;
         
@@ -895,22 +1485,27 @@ function PanelLongitudinalVolumetrics() {
           yPos += 5;
         }
         
-        // Try to capture viewport screenshot
-        setLoadingMessage(`Capturing screenshot for timepoint ${i + 1}...`);
-        const screenshot = await captureViewportScreenshot(tp.displaySetInstanceUID);
+        // Add the tumor bounding box screenshot
+        const screenshot = allScreenshots.get(tp.displaySetInstanceUID);
         
         if (screenshot) {
           checkPageBreak(70);
           yPos += 3;
           
-          // Add screenshot to PDF
-          const imgWidth = contentWidth * 0.7;
-          const imgHeight = imgWidth * 0.75; // Approximate aspect ratio
+          // Add screenshot to PDF - tumor bounding box cropped view
+          const imgWidth = contentWidth * 0.6;
+          const imgHeight = imgWidth; // Square-ish for bounding box crop
           const imgX = margin + (contentWidth - imgWidth) / 2;
           
           try {
             pdf.addImage(screenshot, 'PNG', imgX, yPos, imgWidth, imgHeight);
-            yPos += imgHeight + 5;
+            yPos += imgHeight + 3;
+            
+            // Add caption
+            pdf.setFontSize(8);
+            pdf.setFont('helvetica', 'italic');
+            pdf.text('Tumor region - largest axial slice', pageWidth / 2, yPos, { align: 'center' });
+            yPos += 5;
           } catch (imgError) {
             console.error('Error adding image to PDF:', imgError);
             pdf.text('(Screenshot not available)', margin, yPos);
@@ -966,7 +1561,7 @@ function PanelLongitudinalVolumetrics() {
           pdf.rect(margin + 25, yPos - 3, barLength > 0 ? barLength : 1, 4, 'F');
           
           // Volume label
-          pdf.text(`${volume.toFixed(2)} ml`, margin + 30 + barLength, yPos);
+          pdf.text(`${volume.toFixed(2)} cm³`, margin + 30 + barLength, yPos);
           yPos += 6;
         }
         yPos += 5;
@@ -1007,7 +1602,7 @@ function PanelLongitudinalVolumetrics() {
       setLoading(false);
       setLoadingMessage('');
     }
-  }, [report, selectedSegments, captureViewportScreenshot, uiNotificationService]);
+  }, [report, selectedSegments, captureTumorBoundingBox, uiNotificationService]);
 
   // Get color for percentage change
   const getChangeColor = (percentChange: number): string => {
@@ -1047,6 +1642,14 @@ function PanelLongitudinalVolumetrics() {
                 disabled={loading}
               >
                 CSV
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => exportToMarkdown(new Map())}
+                disabled={loading}
+              >
+                MD
               </Button>
               <Button
                 variant="ghost"
@@ -1147,12 +1750,12 @@ function PanelLongitudinalVolumetrics() {
                           </span>
                         </div>
                         <div className="text-xs text-gray-400">
-                          {formatDicomDate(vc.changes[0]?.fromDate)}: <span className="text-white">{firstVolume.toFixed(2)} ml</span>
+                          {formatDicomDate(vc.changes[0]?.fromDate)}: <span className="text-white">{firstVolume.toFixed(2)} cm³</span>
                           {' → '}
-                          {formatDicomDate(vc.changes[vc.changes.length - 1]?.toDate)}: <span className="text-white">{lastVolume.toFixed(2)} ml</span>
+                          {formatDicomDate(vc.changes[vc.changes.length - 1]?.toDate)}: <span className="text-white">{lastVolume.toFixed(2)} cm³</span>
                           {' '}
                           <span className={getChangeColor(overallPctChange)}>
-                            ({overallAbsChange >= 0 ? '+' : ''}{overallAbsChange.toFixed(2)} ml)
+                            ({overallAbsChange >= 0 ? '+' : ''}{overallAbsChange.toFixed(2)} cm³)
                           </span>
                         </div>
                         
@@ -1190,7 +1793,7 @@ function PanelLongitudinalVolumetrics() {
                     <span className="text-sm text-gray-400">{tp.seriesDescription}</span>
                   </div>
                   <div className="text-sm text-gray-300 mb-2">
-                    Total: <span className="font-mono">{tp.totalVolumeMl.toFixed(2)} ml</span>
+                    Total: <span className="font-mono">{tp.totalVolumeMl.toFixed(2)} cm³</span>
                   </div>
                   <div className="grid grid-cols-1 gap-1">
                     {tp.segments
@@ -1201,7 +1804,7 @@ function PanelLongitudinalVolumetrics() {
                           className="flex justify-between text-xs bg-gray-800 rounded px-2 py-1"
                         >
                           <span>{seg.label}</span>
-                          <span className="font-mono">{seg.volumeMl.toFixed(2)} ml</span>
+                          <span className="font-mono">{seg.volumeMl.toFixed(2)} cm³</span>
                         </div>
                       ))
                     }
@@ -1220,16 +1823,68 @@ function PanelLongitudinalVolumetrics() {
               
               {/* Get all unique segment labels across all timepoints */}
               {(() => {
-                const allLabels = Array.from(new Set(report.timepoints.flatMap(tp => tp.segments.map(s => s.label))))
+                // Normalize label function to ensure consistency across different segmentation sources
+                // This handles various naming conventions from nnUNet, nnInteractive, and manual segmentations
+                const normalizeLabel = (label: string) => {
+                  let normalized = label.trim().toLowerCase();
+                  
+                  // Remove "background;" prefix
+                  normalized = normalized.replace(/^background;?\s*/i, '');
+                  
+                  // Handle nninter_pred_* patterns -> "segmentation"
+                  if (normalized.match(/^nninter_pred_\d+$/)) {
+                    return 'segmentation';
+                  }
+                  
+                  // Handle nnunet_init_* patterns -> "segmentation"
+                  if (normalized.match(/^nnunet_init_\d+$/)) {
+                    return 'segmentation';
+                  }
+                  
+                  // Handle nnunet_auto_pred_* patterns -> "segmentation"
+                  if (normalized.match(/^nnunet_auto_pred_\d+$/)) {
+                    return 'segmentation';
+                  }
+                  
+                  // Handle "nnunet + interactive" and similar -> "segmentation"
+                  if (normalized.includes('nnunet') || normalized.includes('interactive')) {
+                    return 'segmentation';
+                  }
+                  
+                  // Handle "segment 1", "segment 2", etc. -> keep as is but normalize
+                  const segmentMatch = normalized.match(/segment\s*(\d+)/);
+                  if (segmentMatch) {
+                    return `segment ${segmentMatch[1]}`;
+                  }
+                  
+                  // Normalize whitespace for anything else
+                  return normalized.replace(/\s+/g, ' ').trim();
+                };
+                
+                // Get all unique NORMALIZED segment labels
+                const allRawLabels = report.timepoints.flatMap(tp => tp.segments.map(s => s.label));
+                const normalizedToOriginal = new Map<string, string>();
+                
+                // Build mapping of normalized labels to their first occurrence (original form)
+                for (const rawLabel of allRawLabels) {
+                  const normalized = normalizeLabel(rawLabel);
+                  if (!normalizedToOriginal.has(normalized)) {
+                    normalizedToOriginal.set(normalized, rawLabel);
+                  }
+                }
+                
+                const allLabels = Array.from(normalizedToOriginal.values())
                   .filter(label => selectedSegments.includes(label));
                 
                 // Calculate global max for consistent Y-axis across all segments
-                const allVolumes = allLabels.flatMap(label => 
-                  report.timepoints.map(tp => {
-                    const seg = tp.segments.find(s => s.label === label);
+                const allVolumes = allLabels.flatMap(label => {
+                  const normalizedLabel = normalizeLabel(label);
+                  return report.timepoints.map(tp => {
+                    // Find segment by normalized label match
+                    const seg = tp.segments.find(s => normalizeLabel(s.label) === normalizedLabel);
                     return seg?.volumeMl || 0;
-                  })
-                );
+                  });
+                });
                 const globalMaxVolume = Math.max(...allVolumes, 0.1);
                 
                 // Generate Y-axis tick values (5 ticks)
@@ -1301,7 +1956,7 @@ function PanelLongitudinalVolumetrics() {
                         fontSize="8"
                         transform={`rotate(-90, 10, ${chartHeight / 2})`}
                       >
-                        Volume (ml)
+                        Volume (cm³)
                       </text>
                       
                       {/* X-axis labels (dates) */}
@@ -1324,8 +1979,10 @@ function PanelLongitudinalVolumetrics() {
                       {/* Lines and points for each segment */}
                       {allLabels.map((segmentLabel, labelIdx) => {
                         const color = colors[labelIdx % colors.length];
+                        const normalizedLabel = normalizeLabel(segmentLabel);
                         const points = report.timepoints.map((tp, idx) => {
-                          const seg = tp.segments.find(s => s.label === segmentLabel);
+                          // Find segment by normalized label match
+                          const seg = tp.segments.find(s => normalizeLabel(s.label) === normalizedLabel);
                           const volume = seg?.volumeMl || 0;
                           const x = padding.left + (idx / Math.max(report.timepoints.length - 1, 1)) * plotWidth;
                           const y = padding.top + plotHeight - (volume / globalMaxVolume) * plotHeight;
@@ -1362,7 +2019,7 @@ function PanelLongitudinalVolumetrics() {
                                   className="cursor-pointer"
                                 />
                                 {/* Tooltip - shows on hover via CSS */}
-                                <title>{`${p.date}: ${p.volume.toFixed(2)} ml`}</title>
+                                <title>{`${p.date}: ${p.volume.toFixed(2)} cm³`}</title>
                               </g>
                             ))}
                           </g>

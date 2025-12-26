@@ -59,10 +59,17 @@ function _getDisplaySetsFromSeries(
     isOverlayDisplaySet: true,
   };
 
+  console.log('[SEG SOP Handler] Creating SEG display set:', {
+    SeriesDescription,
+    SeriesInstanceUID,
+    StudyInstanceUID,
+    displaySetInstanceUID: displaySet.displaySetInstanceUID,
+  });
+
   const referencedSeriesSequence = instance.ReferencedSeriesSequence;
 
   if (!referencedSeriesSequence) {
-    console.error('ReferencedSeriesSequence is missing for the SEG');
+    console.error('[SEG SOP Handler] ReferencedSeriesSequence is missing for the SEG');
     return;
   }
 
@@ -70,6 +77,8 @@ function _getDisplaySetsFromSeries(
 
   displaySet.referencedImages = instance.ReferencedSeriesSequence.ReferencedInstanceSequence;
   displaySet.referencedSeriesInstanceUID = referencedSeries.SeriesInstanceUID;
+  console.log('[SEG SOP Handler] Referenced series:', displaySet.referencedSeriesInstanceUID);
+  
   const { displaySetService } = servicesManager.services;
   const referencedDisplaySets = displaySetService.getDisplaySetsForSeries(
     displaySet.referencedSeriesInstanceUID
@@ -78,6 +87,7 @@ function _getDisplaySetsFromSeries(
   const referencedDisplaySet = referencedDisplaySets[0];
 
   if (!referencedDisplaySet) {
+    console.log('[SEG SOP Handler] Referenced display set not found yet, subscribing to DISPLAY_SETS_ADDED');
     // subscribe to display sets added which means at some point it will be available
     const { unsubscribe } = displaySetService.subscribe(
       displaySetService.EVENTS.DISPLAY_SETS_ADDED,
@@ -88,12 +98,14 @@ function _getDisplaySetsFromSeries(
         // to the referencedDisplaySet
         const addedDisplaySet = displaySetsAdded[0];
         if (addedDisplaySet.SeriesInstanceUID === displaySet.referencedSeriesInstanceUID) {
+          console.log('[SEG SOP Handler] Found referenced display set:', addedDisplaySet.displaySetInstanceUID);
           displaySet.referencedDisplaySetInstanceUID = addedDisplaySet.displaySetInstanceUID;
           unsubscribe();
         }
       }
     );
   } else {
+    console.log('[SEG SOP Handler] Referenced display set found:', referencedDisplaySet.displaySetInstanceUID);
     displaySet.referencedDisplaySetInstanceUID = referencedDisplaySet.displaySetInstanceUID;
   }
 
@@ -147,6 +159,19 @@ function _load(
       })
       .catch(error => {
         segDisplaySet.loading = false;
+        
+        // Fire SEGMENTATION_LOADING_COMPLETE event even on error
+        // to prevent UI from being stuck on "Loading SEG..."
+        segmentationService._broadcastEvent(
+          segmentationService.EVENTS.SEGMENTATION_LOADING_COMPLETE,
+          {
+            segmentationId: segDisplaySet.displaySetInstanceUID,
+            segDisplaySet,
+            error: true,
+            errorMessage: error?.message || String(error),
+          }
+        );
+        
         reject(error);
       });
   });
@@ -185,8 +210,9 @@ async function _loadSegments({
     imageIds = images.map(image => image.imageId);
   }
 
-  // Todo: what should be defaults here
-  const tolerance = 0.001;
+  // Increased tolerance for orientation matching to handle minor floating point differences
+  // and slight variations in patient positioning between MRI sessions
+  const tolerance = 0.01;
   eventTarget.addEventListener(Enums.Events.SEGMENTATION_LOAD_PROGRESS, evt => {
     const { percentComplete } = evt.detail;
     segmentationService._broadcastEvent(segmentationService.EVENTS.SEGMENT_LOADING_COMPLETE, {
@@ -194,11 +220,44 @@ async function _loadSegments({
     });
   });
 
-  const results = await adaptersSEG.Cornerstone3D.Segmentation.createFromDICOMSegBuffer(
-    imageIds,
-    arrayBuffer,
-    { metadataProvider: metaData, tolerance }
-  );
+  let results;
+  try {
+    // Log debug information about the SEG being loaded
+    console.log('[SEG Load] Loading SEG:', {
+      SeriesDescription: segDisplaySet.SeriesDescription,
+      referencedSeriesUID: segDisplaySet.referencedSeriesInstanceUID,
+      imageIdsCount: imageIds.length,
+      tolerance,
+    });
+    
+    results = await adaptersSEG.Cornerstone3D.Segmentation.createFromDICOMSegBuffer(
+      imageIds,
+      arrayBuffer,
+      { metadataProvider: metaData, tolerance }
+    );
+  } catch (error) {
+    // Handle orientation mismatch error gracefully
+    const errorMessage = error?.message || String(error);
+    if (errorMessage.includes('orthogonal to the acquisition plane')) {
+      console.warn('[SEG Load] Segmentation orientation mismatch:', {
+        SeriesDescription: segDisplaySet.SeriesDescription,
+        referencedSeriesUID: segDisplaySet.referencedSeriesInstanceUID,
+        error: errorMessage,
+      });
+      uiNotificationService.show({
+        title: 'DICOM SEG Load Warning',
+        message: `Cannot display "${segDisplaySet.SeriesDescription || 'Segmentation'}": The segmentation was saved in a different orientation than the source images. This is a known limitation.`,
+        type: 'warning',
+        duration: 8000,
+      });
+      // Mark as failed to load but don't crash
+      segDisplaySet.loadError = 'orientation_mismatch';
+      segDisplaySet.loadErrorMessage = 'Segmentation orientation does not match source images';
+      throw new Error('Segmentation orientation mismatch - cannot display overlay');
+    }
+    // Re-throw other errors
+    throw error;
+  }
 
   let usedRecommendedDisplayCIELabValue = true;
   results.segMetadata.data.forEach((data, i) => {

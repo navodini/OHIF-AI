@@ -277,12 +277,19 @@ export default class DisplaySetService extends PubSubService {
     // instance list composed only by instances with the same sopClassUID and
     // accumulate the displaySets in the variable allDisplaySets
     const sopClasses = Object.keys(instancesForSetSOPClasses);
+    console.log('[DisplaySetService] makeDisplaySetForInstances called with SOPClassUIDs:', sopClasses);
     let allDisplaySets = [];
     sopClasses.forEach(sopClass => {
+      const instances = instancesForSetSOPClasses[sopClass];
+      console.log('[DisplaySetService] Processing SOPClassUID:', sopClass, 
+        'instances:', instances.length,
+        'first instance SeriesDescription:', instances[0]?.SeriesDescription,
+        'Modality:', instances[0]?.Modality);
       const displaySets = this._makeDisplaySetForInstances(
-        instancesForSetSOPClasses[sopClass],
+        instances,
         settings
       );
+      console.log('[DisplaySetService] Created', displaySets.length, 'display sets for SOPClass:', sopClass);
       allDisplaySets = [...allDisplaySets, ...displaySets];
     });
     return allDisplaySets;

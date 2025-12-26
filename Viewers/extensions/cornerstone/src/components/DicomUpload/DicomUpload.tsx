@@ -3,6 +3,7 @@ import { ReactElement } from 'react';
 import Dropzone from 'react-dropzone';
 import PropTypes from 'prop-types';
 import classNames from 'classnames';
+import { useSystem } from '@ohif/core';
 import DicomFileUploader from '../../utils/DicomFileUploader';
 import DicomUploadProgress from './DicomUploadProgress';
 import { Button, ButtonEnums } from '@ohif/ui';
@@ -15,8 +16,17 @@ type DicomUploadProps = {
 };
 
 function DicomUpload({ dataSource, onComplete, onStarted }: DicomUploadProps): ReactElement {
+  const { servicesManager } = useSystem();
   const baseClassNames = 'min-h-[480px] flex flex-col bg-black select-none';
   const [dicomFileUploaderArr, setDicomFileUploaderArr] = useState([]);
+
+  // Handle upload completion
+  // Note: Auto-segmentation cannot run from here because there's no active viewport yet.
+  // The study must be opened in the viewer first. Auto-segmentation will run when the study is opened.
+  const handleUploadComplete = () => {
+    console.log('DICOM upload complete. Open the study to trigger auto-segmentation.');
+    onComplete();
+  };
 
   const onDrop = useCallback(async acceptedFiles => {
     onStarted();
@@ -89,7 +99,7 @@ function DicomUpload({ dataSource, onComplete, onStarted }: DicomUploadProps): R
         <div className={classNames('h-[calc(100vh-300px)]', baseClassNames)}>
           <DicomUploadProgress
             dicomFileUploaderArr={Array.from(dicomFileUploaderArr)}
-            onComplete={onComplete}
+            onComplete={handleUploadComplete}
           />
         </div>
       ) : (

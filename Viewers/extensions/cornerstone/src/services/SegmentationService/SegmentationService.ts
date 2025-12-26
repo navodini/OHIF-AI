@@ -746,11 +746,30 @@ class SegmentationService extends PubSubService {
     const activeSegmentation = this.getActiveSegmentation(viewportId);
 
     if (!activeSegmentation) {
+      console.log('getActiveSegment: No active segmentation found');
       return;
     }
 
-    const { segments } = activeSegmentation;
+    const { segments, segmentationId } = activeSegmentation;
 
+    // Use cornerstone tools' getActiveSegmentIndex to get the currently active segment index
+    const activeSegmentIndex = cstSegmentation.segmentIndex.getActiveSegmentIndex(segmentationId);
+    console.log('getActiveSegment: segmentationId:', segmentationId);
+    console.log('getActiveSegment: activeSegmentIndex from cstSegmentation:', activeSegmentIndex);
+    console.log('getActiveSegment: available segments:', Object.keys(segments));
+
+    // Return the segment at the active index if it exists
+    // Check for null, undefined, and that segments[activeSegmentIndex] exists
+    // Try both number and string keys since the segments object may use either
+    if (activeSegmentIndex != null && activeSegmentIndex > 0) {
+      const segment = segments[activeSegmentIndex] || segments[String(activeSegmentIndex)];
+      if (segment) {
+        console.log('getActiveSegment: Found segment at index', activeSegmentIndex);
+        return segment;
+      }
+    }
+
+    // Fallback: check segment.active property (for backwards compatibility)
     let activeSegment;
     for (const segment of Object.values(segments)) {
       if (segment.active) {
@@ -759,6 +778,7 @@ class SegmentationService extends PubSubService {
       }
     }
 
+    console.log('getActiveSegment: Fallback result:', activeSegment);
     return activeSegment;
   }
 

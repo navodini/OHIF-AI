@@ -231,17 +231,19 @@ function WorkList({
     // Note: expanded rows index begins at 1
     for (let z = 0; z < expandedRows.length; z++) {
       const expandedRowIndex = expandedRows[z] - 1;
-      const studyInstanceUid = sortedStudies[expandedRowIndex].studyInstanceUid;
+      if (expandedRowIndex >= 0 && expandedRowIndex < sortedStudies.length) {
+        const studyInstanceUid = sortedStudies[expandedRowIndex].studyInstanceUid;
 
-      if (studiesWithSeriesData.includes(studyInstanceUid)) {
-        continue;
+        if (studiesWithSeriesData.includes(studyInstanceUid)) {
+          continue;
+        }
+
+        fetchSeries(studyInstanceUid);
       }
-
-      fetchSeries(studyInstanceUid);
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expandedRows, studies]);
+  }, [expandedRows, studies, sortedStudies, studiesWithSeriesData]);
 
   const isFiltering = (filterValues, defaultFilterValues) => {
     return !isEqual(filterValues, defaultFilterValues);

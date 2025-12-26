@@ -93,10 +93,30 @@ const commandsModule = ({
     generateSegmentation: ({ segmentationId, options = {} }) => {
       const segmentation = cornerstoneToolsSegmentation.state.getSegmentation(segmentationId);
 
-      const { imageIds } = segmentation.representationData.Labelmap;
+      const { imageIds, referencedImageIds: storedReferencedImageIds } = segmentation.representationData.Labelmap;
 
       const segImages = imageIds.map(imageId => cache.getImage(imageId));
-      const referencedImages = segImages.map(image => cache.getImage(image.referencedImageId));
+      
+      // Use the stored referencedImageIds from the representation data if available,
+      // otherwise fall back to the referencedImageId property on each derived image.
+      // This is important for cases where the slice order was flipped - the stored
+      // referencedImageIds will be in the correct order.
+      let referencedImages;
+      if (storedReferencedImageIds && storedReferencedImageIds.length === segImages.length) {
+        referencedImages = storedReferencedImageIds.map(refId => cache.getImage(refId));
+        console.log('[SEG Generate] Using stored referencedImageIds from representation data');
+      } else {
+        referencedImages = segImages.map(image => cache.getImage(image.referencedImageId));
+        console.log('[SEG Generate] Using referencedImageId property from derived images');
+      }
+
+      console.log('[SEG Generate Debug] segmentationId:', segmentationId);
+      console.log('[SEG Generate Debug] imageIds count:', imageIds?.length);
+      console.log('[SEG Generate Debug] storedReferencedImageIds count:', storedReferencedImageIds?.length);
+      console.log('[SEG Generate Debug] First 3 imageIds:', imageIds?.slice(0, 3));
+      console.log('[SEG Generate Debug] First 3 storedReferencedImageIds:', storedReferencedImageIds?.slice(0, 3));
+      console.log('[SEG Generate Debug] First 3 segImage.referencedImageIds:', segImages?.slice(0, 3).map(img => img?.referencedImageId));
+      console.log('[SEG Generate Debug] First 3 referencedImages imageIds:', referencedImages?.slice(0, 3).map(img => img?.imageId));
 
       const labelmaps2D = [];
 
@@ -240,7 +260,7 @@ const commandsModule = ({
      * @returns {Object|void} Returns the naturalized report if successfully stored,
      * otherwise throws an error.
      */
-    storeSegmentation: async ({ segmentationId, dataSource, defaultSeriesDescription }) => {
+    storeSegmentation: async ({ segmentationId, dataSource, defaultSeriesDescription, autoSave = false, deleteOldSegs = false }) => {
       const segmentation = segmentationService.getSegmentation(segmentationId);
 
       if (!segmentation) {
@@ -250,22 +270,24 @@ const commandsModule = ({
       const { label } = segmentation;
       const defaultDataSource = dataSource ?? extensionManager.getActiveDataSource();
 
-      const {
-        value: reportName,
-        dataSourceName: selectedDataSource,
-        action,
-      } = await createReportDialogPrompt({
-        servicesManager,
-        extensionManager,
-        title: 'Store Segmentation',
-        defaultValue: defaultSeriesDescription || label || '',
-      });
+      let reportName = defaultSeriesDescription || label || 'Research Derived Series';
+      let action = PROMPT_RESPONSES.CREATE_REPORT;
+
+      // If not auto-save, show dialog
+      if (!autoSave) {
+        const result = await createReportDialogPrompt({
+          servicesManager,
+          extensionManager,
+          title: 'Store Segmentation',
+          defaultValue: reportName,
+        });
+        reportName = result.value;
+        action = result.action;
+      }
 
       if (action === PROMPT_RESPONSES.CREATE_REPORT) {
         try {
-          const selectedDataSourceConfig = selectedDataSource
-            ? extensionManager.getDataSources(selectedDataSource)[0]
-            : defaultDataSource;
+          const selectedDataSourceConfig = defaultDataSource;
 
           const generatedData = actions.generateSegmentation({
             segmentationId,
@@ -285,8 +307,39 @@ const commandsModule = ({
           } else {
             selectedDataSourceConfig_new = selectedDataSourceConfig;
           }
-          
+
+          // Get the study UID from the naturalized report for deletion logic
+          const reportStudyUID = naturalizedReport.StudyInstanceUID;
+
+          // First, save the new SEG
           await selectedDataSourceConfig_new.store.dicom(naturalizedReport);
+          
+          // Then delete old SEGs ONLY from the SAME study/session
+          // This replaces previous segmentations of the same session while preserving other sessions
+          if (deleteOldSegs && selectedDataSourceConfig_new?.store?.deleteSeries && reportStudyUID) {
+            try {
+              const displaySets = displaySetService.getActiveDisplaySets();
+              // Only delete SEGs from the SAME study (current session)
+              const segDisplaySets = displaySets.filter(
+                ds => ds.Modality === 'SEG' && ds.StudyInstanceUID === reportStudyUID
+              );
+              
+              for (const segDS of segDisplaySets) {
+                // Don't delete the series we just saved
+                if (segDS.SeriesInstanceUID !== naturalizedReport.SeriesInstanceUID) {
+                  try {
+                    await selectedDataSourceConfig_new.store.deleteSeries(reportStudyUID, segDS.SeriesInstanceUID);
+                    console.log('Deleted previous SEG from same session:', segDS.SeriesInstanceUID);
+                  } catch (err) {
+                    console.warn('Failed to delete old SEG series', segDS.SeriesInstanceUID, err);
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn('Error during cleanup of old SEGs:', err);
+              // Don't throw - the save was successful, this is just cleanup
+            }
+          }
           
           // add the information for where we stored it to the instance as well
           naturalizedReport.wadoRoot = selectedDataSourceConfig_new.getConfig().wadoRoot;

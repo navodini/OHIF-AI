@@ -193,6 +193,19 @@ const OHIFCornerstoneViewport = React.memo(
         // will get cleaned up and they need the viewportInfo to be present
         cleanUpServices(viewportInfo);
 
+        // Reset nninter session state for the series being unloaded
+        // This ensures that when the user returns to this study, segmentations will be loaded again
+        if (displaySets && displaySets.length > 0) {
+          displaySets.forEach(ds => {
+            if (ds.SeriesInstanceUID && ds.Modality !== 'SEG') {
+              console.log('[Viewport Cleanup] Resetting nninter session state for series:', ds.SeriesInstanceUID);
+              commandsManager.run('resetNninterSessionState', { 
+                seriesInstanceUID: ds.SeriesInstanceUID 
+              });
+            }
+          });
+        }
+
         if (onElementDisabled && typeof onElementDisabled === 'function') {
           onElementDisabled(viewportInfo);
         }

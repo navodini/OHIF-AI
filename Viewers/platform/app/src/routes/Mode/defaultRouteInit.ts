@@ -52,6 +52,15 @@ export async function defaultRouteInit(
     function ({ StudyInstanceUID, SeriesInstanceUID, madeInClient = false }) {
       const seriesMetadata = DicomMetadataStore.getSeries(StudyInstanceUID, SeriesInstanceUID);
 
+      console.log('[defaultRouteInit] INSTANCES_ADDED for series:', {
+        SeriesInstanceUID: SeriesInstanceUID?.substring(0, 20) + '...',
+        StudyInstanceUID: StudyInstanceUID?.substring(0, 20) + '...',
+        instanceCount: seriesMetadata?.instances?.length,
+        Modality: seriesMetadata?.instances?.[0]?.Modality,
+        SeriesDescription: seriesMetadata?.instances?.[0]?.SeriesDescription,
+        SOPClassUID: seriesMetadata?.instances?.[0]?.SOPClassUID,
+      });
+
       // checks if the series filter was used, if it exists
       const seriesInstanceUIDs = filters?.seriesInstanceUID;
       if (

@@ -21,7 +21,7 @@ import promptSaveReport from './utils/promptSaveReport';
 
 import { Enums as csToolsEnums, Types as cstTypes, segmentation as csToolsSegmentation } from '@cornerstonejs/tools';
 import { updateLabelmapSegmentationImageReferences } from '@cornerstonejs/tools/segmentation/updateLabelmapSegmentationImageReferences';
-import { cache, imageLoader, metaData, Types as csTypes, utilities as csUtils } from '@cornerstonejs/core';
+import { cache, imageLoader, metaData, Types as csTypes, utilities as csUtils, eventTarget, triggerEvent, Enums as csEnums } from '@cornerstonejs/core';
 import { adaptersSEG } from '@cornerstonejs/adapters';
 const LABELMAP = csToolsEnums.SegmentationRepresentations.Labelmap;
 import MonaiLabelClient from '../../monai-label/src/services/MonaiLabelClient';
@@ -42,6 +42,54 @@ export type HangingProtocolParams = {
 export type UpdateViewportDisplaySetParams = {
   direction: number;
   excludeNonImageModalities?: boolean;
+};
+
+// Track which series have been initialized to prevent duplicate calls
+const nninterSessionState = {
+  initializedSeries: new Set<string>(),
+  autoSegmentationRanFor: new Set<string>(),
+  segmentationsLoadedFor: new Set<string>(), // Track which series have had segmentations loaded
+  
+  isInitialized(seriesUID: string): boolean {
+    return this.initializedSeries.has(seriesUID);
+  },
+  
+  markInitialized(seriesUID: string): void {
+    this.initializedSeries.add(seriesUID);
+    console.log(`[nninterSessionState] Marked series as initialized: ${seriesUID}`);
+  },
+  
+  hasAutoSegmentationRan(seriesUID: string): boolean {
+    return this.autoSegmentationRanFor.has(seriesUID);
+  },
+  
+  markAutoSegmentationRan(seriesUID: string): void {
+    this.autoSegmentationRanFor.add(seriesUID);
+    console.log(`[nninterSessionState] Marked auto-segmentation as done for: ${seriesUID}`);
+  },
+  
+  hasSegmentationsLoaded(seriesUID: string): boolean {
+    return this.segmentationsLoadedFor.has(seriesUID);
+  },
+  
+  markSegmentationsLoaded(seriesUID: string): void {
+    this.segmentationsLoadedFor.add(seriesUID);
+    console.log(`[nninterSessionState] Marked segmentations as loaded for series: ${seriesUID}`);
+  },
+  
+  reset(seriesUID?: string): void {
+    if (seriesUID) {
+      this.initializedSeries.delete(seriesUID);
+      this.autoSegmentationRanFor.delete(seriesUID);
+      this.segmentationsLoadedFor.delete(seriesUID);
+      console.log(`[nninterSessionState] State reset for series: ${seriesUID}`);
+    } else {
+      this.initializedSeries.clear();
+      this.autoSegmentationRanFor.clear();
+      this.segmentationsLoadedFor.clear();
+      console.log('[nninterSessionState] State fully reset');
+    }
+  }
 };
 
 const commandsModule = ({
@@ -823,16 +871,24 @@ const commandsModule = ({
                 const segment = segments[j];
                 if (segment.cachedStats?.algorithmType !== undefined) {
                   existingseriesInstanceUid = segment.cachedStats.algorithmType;
+                  console.log('Found existing segmentation with algorithmType:', existingseriesInstanceUid);
                 }
               }
             }
             
-            if (existingseriesInstanceUid === currentDisplaySets.SeriesInstanceUID) {
+            // Match if algorithmType is the SeriesInstanceUID OR 'nninteractive' (for refinement)
+            if (existingseriesInstanceUid === currentDisplaySets.SeriesInstanceUID ||
+                existingseriesInstanceUid === 'nninteractive') {
               existingSegments = activeSegmentation.segments || {};
               segmentationId = activeSegmentation.segmentationId;
               segImageIds = activeSegmentation.representationData.Labelmap.imageIds;
               existing = true;
+              console.log('Reusing existing segmentation for interactive refinement:', segmentationId);
+            } else {
+              console.log('No matching existing segmentation found. Current SeriesInstanceUID:', currentDisplaySets.SeriesInstanceUID, 'Existing:', existingseriesInstanceUid);
             }
+          } else {
+            console.log('No active segmentation found, will create new one');
           }
           
           let merged_derivedImages = [];
@@ -913,16 +969,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map(v => v === 1 ? segmentNumber : v));
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              derivedImages_new.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
             merged_derivedImages = derivedImages_new
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -942,27 +993,37 @@ const commandsModule = ({
               }
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map((v, idx) => v === 1 ? segmentNumber : scalarData[idx]));
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              merged_derivedImages.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
           }
         }
-          
+        
+          // Trigger segmentation data modified event to notify cornerstone of the changes
+          triggerEvent(eventTarget, csToolsEnums.Events.SEGMENTATION_DATA_MODIFIED, {
+            segmentationId,
+          });
+          console.log('Triggered SEGMENTATION_DATA_MODIFIED event (sam2) for segmentationId:', segmentationId);
                     
-          const derivedImageIds = merged_derivedImages.map(image => image.imageId);  
+          const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+          // Get referencedImageIds from derived images to ensure correct order after any flipping
+          const referencedImageIds = merged_derivedImages.map(image => image.referencedImageId);
+          console.log(`[SEG Debug sam2] flipped=${flipped}, imageIds count=${imageIds?.length}, derivedImageIds count=${derivedImageIds?.length}`);
+          console.log(`[SEG Debug sam2] First 3 imageIds:`, imageIds?.slice(0, 3));
+          console.log(`[SEG Debug sam2] First 3 derivedImageIds:`, derivedImageIds?.slice(0, 3));
+          console.log(`[SEG Debug sam2] First 3 referencedImageIds:`, referencedImageIds?.slice(0, 3));
           console.log(`Just after derivedImageIds: ${(Date.now() - start)/1000} Seconds`);
+          // Mark all other segments as inactive, then set this one as active
+          for (const seg of Object.values(segments)) {
+            seg.active = false;
+          }
           segments[segmentNumber] = {
             segmentIndex: segmentNumber,
             label: label_name,
             locked: false,
-            active: false,
+            active: true,
             cachedStats: {
 
               modifiedTime: utils.formatDate(Date.now(), 'YYYYMMDD'),
@@ -986,7 +1047,7 @@ const commandsModule = ({
                       data: {
                         imageIds: derivedImageIds,
                         referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                        referencedImageIds: imageIds,
+                        referencedImageIds: referencedImageIds,
                       }
                   },
                   config: {
@@ -1013,12 +1074,23 @@ const commandsModule = ({
                   [LABELMAP]: {
                     imageIds: derivedImageIds,
                     referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                    referencedImageIds: imageIds,
+                    referencedImageIds: referencedImageIds,
                   }
                 }
               },
             },
           ]);
+          
+          // Force a render of all viewports to ensure the updated segmentation is displayed
+          try {
+            const renderingEngine = servicesManager.services.cornerstoneViewportService.getRenderingEngine();
+            if (renderingEngine) {
+              renderingEngine.render();
+              console.log('Forced render after segmentation update (sam2)');
+            }
+          } catch (renderErr) {
+            console.warn('Failed to force render after segmentation update:', renderErr);
+          }
           }
           servicesManager.services.segmentationService.setActiveSegment(segmentationId, segmentNumber);
           toolboxState.setCurrentActiveSegment(segmentNumber);
@@ -1028,13 +1100,23 @@ const commandsModule = ({
           if(toolboxState.getRefineNew()){
             toolboxState.setRefineNew(false);
           }
+
+          // Wait for segmentation to be properly processed before rendering
+          await new Promise(resolve => setTimeout(resolve, 100));
+
           // semi-hack: to render segmentation properly on the current image
-          let somewhereIndex = 0;
-          if(currentImageIdIndex === 0){
-            somewhereIndex = 1;
+          // Wrapped in try-catch to prevent rendering errors from breaking the workflow
+          try {
+            let somewhereIndex = 0;
+            if(currentImageIdIndex === 0){
+              somewhereIndex = 1;
+            }
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay between renders
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+          } catch (renderError) {
+            console.warn('Segmentation rendering adjustment failed, but segmentation should still be visible:', renderError);
           }
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
           // Recover the visibility of the segments
           for (let i = 0; i < representations.length; i++) {
             const representation = representations[i];
@@ -1056,7 +1138,7 @@ const commandsModule = ({
         throw error;
       }
     },
-    async initNninter( options: {viewportId: string} = {viewportId: undefined} ){
+    async initNninter( options: {viewportId: string, force?: boolean} = {viewportId: undefined, force: false} ){
 
       let { activeViewportId, viewports } = viewportGridService.getState();
       if(options.viewportId !== undefined){
@@ -1079,7 +1161,35 @@ const commandsModule = ({
       if(currentDisplaySets === undefined || currentDisplaySets.Modality === "SEG"){
         return;
       }
-      let url = `/monai/infer/segmentation?image=${currentDisplaySets.SeriesInstanceUID}&output=dicom_seg`;
+      
+      const seriesUID = currentDisplaySets.SeriesInstanceUID;
+      
+      console.log('[initNninter] ========== INIT NNINTER CALLED ==========');
+      console.log('[initNninter] Series UID:', seriesUID);
+      console.log('[initNninter] Is already initialized?', nninterSessionState.isInitialized(seriesUID));
+      console.log('[initNninter] Force flag:', options.force);
+      
+      // Check if already initialized for this series (unless force=true)
+      if (!options.force && nninterSessionState.isInitialized(seriesUID)) {
+        console.log(`[initNninter] Skipping init - already initialized for series: ${seriesUID}`);
+        
+        // Still try to load existing segmentations even if init is skipped
+        // This handles the case where user reopens a study that has saved SEGs
+        console.log('[initNninter] Still checking for existing segmentations to load...');
+        setTimeout(() => {
+          commandsManager.run('loadExistingSegmentations', {
+            studyInstanceUID: currentDisplaySets.StudyInstanceUID,
+            seriesInstanceUID: seriesUID,
+            activeViewportId: activeViewportId
+          });
+        }, 500);
+        
+        return;
+      }
+      
+      console.log(`[initNninter] Initializing for series: ${seriesUID}`);
+      
+      let url = `/monai/infer/segmentation?image=${seriesUID}&output=dicom_seg`;
       let params = {
         largest_cc: false,
         result_extension: '.nii.gz',
@@ -1116,6 +1226,23 @@ const commandsModule = ({
       try {
         const response = await initPromise;
         if (response.status === 200) {
+          console.log('[initNninter] nninter session initialized successfully for series:', seriesUID);
+          
+          // Mark this series as initialized to prevent duplicate calls
+          nninterSessionState.markInitialized(seriesUID);
+          
+          // After init, check if there are existing segmentations and load them
+          // Do NOT run auto-segmentation automatically - only load if already exists
+          console.log('[initNninter] Scheduling loadExistingSegmentations check in 1.5 seconds...');
+          setTimeout(() => {
+            console.log('[initNninter] Now checking for existing segmentations...');
+            commandsManager.run('loadExistingSegmentations', {
+              studyInstanceUID: currentDisplaySets.StudyInstanceUID,
+              seriesInstanceUID: seriesUID,
+              activeViewportId: activeViewportId
+            });
+          }, 1500); // Reduced delay
+          
           return response;
         }
       } catch (error) {
@@ -1174,6 +1301,10 @@ const commandsModule = ({
       try {
         const response = await resetPromise;
         if (response.status === 200) {
+          // Reset the session tracking state for this series
+          nninterSessionState.reset(currentDisplaySets.SeriesInstanceUID);
+          console.log(`[resetNninter] Reset session state for series: ${currentDisplaySets.SeriesInstanceUID}`);
+          
           if (options.clearMeasurements) {
             commandsManager.run('clearMeasurements')
           }
@@ -1218,8 +1349,23 @@ const commandsModule = ({
       const activeSegmentation = servicesManager.services.segmentationService.getActiveSegmentation(activeViewportId)
       let segmentNumber = 1;
       let segments: { [segmentIndex: string]: cstTypes.Segment } = {};
-      let segmentationId = `${csUtils.uuidv4()}`
+      let segmentationId = `${csUtils.uuidv4()}`; // Default new ID
+      let isModifyingAutoSeg = false;
+      
       if (activeSegmentation !== undefined){
+        // Check if this is an auto-segmentation by looking at algorithmType
+        const segmentValues = Object.values(activeSegmentation.segments);
+        const hasAutoSegmentation = segmentValues.some(seg => 
+          seg.cachedStats?.algorithmType === currentDisplaySets.SeriesInstanceUID
+        );
+        
+        if (hasAutoSegmentation) {
+          console.log('Detected existing auto-segmentation, will modify and replace it with interactive refinement');
+          isModifyingAutoSeg = true;
+        }
+        
+        // Reuse existing segmentation ID to modify the same overlay
+        segmentationId = activeSegmentation.segmentationId;
         segments = activeSegmentation.segments;
       if (Object.values(segments).length > 0) {
         // Find the minimum available segment number
@@ -1235,6 +1381,9 @@ const commandsModule = ({
         segmentNumber = minAvailableNumber;
         if (!toolboxState.getRefineNew()) {
           const activeSegment = servicesManager.services.segmentationService.getActiveSegment(activeViewportId);
+          console.log('nninter: getRefineNew is false, checking activeSegment:', activeSegment);
+          console.log('nninter: activeSegmentation:', activeSegmentation?.segmentationId);
+          console.log('nninter: segments:', Object.keys(segments));
           if (activeSegment !== undefined){
             for (let i = 0; i < unAssignedMeasurements.length; i++) {
               const e = unAssignedMeasurements[i];
@@ -1463,11 +1612,14 @@ const commandsModule = ({
                 }
               }
               
-              if (existingseriesInstanceUid === currentDisplaySets.SeriesInstanceUID) {
+              // Match if algorithmType is the SeriesInstanceUID OR 'nninteractive' (for refinement)
+              if (existingseriesInstanceUid === currentDisplaySets.SeriesInstanceUID || 
+                  existingseriesInstanceUid === 'nninteractive') {
                 existingSegments = activeSegmentation.segments || {};
                 segmentationId = activeSegmentation.segmentationId;
                 segImageIds = activeSegmentation.representationData.Labelmap.imageIds;
                 existing = true;
+                console.log('Found existing segmentation for refinement:', segmentationId, 'algorithmType:', existingseriesInstanceUid);
               }
             }
 
@@ -1586,34 +1738,43 @@ const commandsModule = ({
               }
               if (sliceData.some(v => v === 1)){
                 voxelManager.setScalarData(sliceData.map((v, idx) => v === 1 ? segmentNumber : scalarData[idx]));
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if(flipped){
-              merged_derivedImages.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
 
           }
           
         }
-          
+        
+          // Trigger segmentation data modified event to notify cornerstone of the changes
+          triggerEvent(eventTarget, csToolsEnums.Events.SEGMENTATION_DATA_MODIFIED, {
+            segmentationId,
+          });
+          console.log('Triggered SEGMENTATION_DATA_MODIFIED event for segmentationId:', segmentationId);
                     
-          const derivedImageIds = merged_derivedImages.map(image => image.imageId);  
+          const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+          // Extract the referencedImageIds from the derived images - this ensures correct mapping even when flipped
+          const referencedImageIds = merged_derivedImages.map(image => image.referencedImageId);
           console.log(`Just after derivedImageIds: ${(Date.now() - start)/1000} Seconds`);
+          // Create interactive segment with appropriate naming
+          const interactiveLabel = isModifyingAutoSeg ? 
+            'Interactive Refined Segmentation' : 
+            label_name;
+            
+          // Mark all other segments as inactive, then set this one as active
+          for (const seg of Object.values(segments)) {
+            seg.active = false;
+          }
           segments[segmentNumber] = {
             segmentIndex: segmentNumber,
-            label: label_name,
+            label: interactiveLabel,
             locked: false,
-            active: false,
+            active: true,
             cachedStats: {
-
               modifiedTime: utils.formatDate(Date.now(), 'YYYYMMDD'),
-
-              algorithmType: currentDisplaySets.SeriesInstanceUID,
+              algorithmType: 'nninteractive', // Mark as interactive
               algorithmName: "nninter_"+nninter_elapsed,
               description: prompt_info,
               center:  z_range.length > 0 ? z_range.reduce((sum, z) => sum + z, 0) / z_range.length : 0,
@@ -1632,7 +1793,7 @@ const commandsModule = ({
                       data: {
                         imageIds: derivedImageIds,
                         referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                        referencedImageIds: imageIds,
+                        referencedImageIds: referencedImageIds,
                       }
                   },
                   config: {
@@ -1660,12 +1821,24 @@ const commandsModule = ({
                   [LABELMAP]: {
                     imageIds: derivedImageIds,
                     referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                    referencedImageIds: imageIds,
+                    referencedImageIds: referencedImageIds,
                   }
                 }
               },
             },
           ]);
+          
+          // Force a render of all viewports to ensure the updated segmentation is displayed
+          try {
+            const renderingEngine = servicesManager.services.cornerstoneViewportService.getRenderingEngine();
+            if (renderingEngine) {
+              renderingEngine.render();
+              console.log('Forced render after segmentation update');
+            }
+          } catch (renderErr) {
+            console.warn('Failed to force render after segmentation update:', renderErr);
+          }
+          
           // Update the segmentation stats
           Promise.resolve().then(() => 
             updateSegmentationStats({
@@ -1687,14 +1860,24 @@ const commandsModule = ({
             toolboxState.setRefineNew(false);
           }
           console.log(`After Reps: ${(Date.now() - start)/1000} Seconds`);
+
+          // Wait for segmentation to be properly processed before rendering
+          await new Promise(resolve => setTimeout(resolve, 100));
+
           // semi-hack: to render segmentation properly on the current image
-          let somewhereIndex = 0;
-          if(currentImageIdIndex === 0){
-            somewhereIndex = 1;
+          // Wrapped in try-catch to prevent rendering errors from breaking the workflow
+          try {
+            let somewhereIndex = 0;
+            if(currentImageIdIndex === 0){
+              somewhereIndex = 1;
+            }
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay between renders
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+            console.log(`After semi hack: ${(Date.now() - start)/1000} Seconds`);
+          } catch (renderError) {
+            console.warn('Segmentation rendering adjustment failed, but segmentation should still be visible:', renderError);
           }
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
-          console.log(`After semi hack: ${(Date.now() - start)/1000} Seconds`);
           // Recover the visibility of the segments
           for (let i = 0; i < representations.length; i++) {
             const representation = representations[i];
@@ -1713,6 +1896,15 @@ const commandsModule = ({
           //});
           const end = Date.now();
           console.log(`Time taken: ${(end - start)/1000} Seconds`);
+          
+          // Note: Auto-save and overlay cleanup are now handled separately
+          // Do not auto-save on every scribble - let user manually save when ready
+          if (isModifyingAutoSeg) {
+            console.log('Modified existing auto-segmentation with interactive refinement');
+            // The existing segmentation overlay is now updated with interactive refinement
+            // User can save manually using the save button when satisfied
+          }
+          
           return response;
         }
       } catch (error) {
@@ -1783,7 +1975,7 @@ const commandsModule = ({
         result_compress: false,
         studyInstanceUID: currentDisplaySets.StudyInstanceUID,
         restore_label_idx: false,
-        nninter: "nnunet_auto",
+        nninter: "nnunet_init",
       };
 
       let data = MonaiLabelClient.constructFormData(params, null);
@@ -1798,14 +1990,14 @@ const commandsModule = ({
 
       // Show notification with promise support
       uiNotificationService.show({
-        title: 'nnUNet Auto Segmentation',
-        message: 'Running fully automatic segmentation...',
+        title: 'nnUNet + nnInteractive Init',
+        message: 'Running auto segmentation and initializing interactive mode...',
         type: 'info',
         promise: segmentationPromise,
         promiseMessages: {
-          loading: 'Running nnUNet auto segmentation...',
-          success: () => 'nnUNet Auto Segmentation - Successful',
-          error: (error) => `nnUNet Auto Segmentation - Failed: ${error.message || 'Unknown error'}`,
+          loading: 'Running nnUNet and preparing for interactive editing...',
+          success: () => 'nnUNet + nnInteractive - Ready for interactive refinement',
+          error: (error) => `nnUNet + nnInteractive - Failed: ${error.message || 'Unknown error'}`,
         },
       });
 
@@ -1850,16 +2042,11 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(sliceData);
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              derivedImages_new.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
             merged_derivedImages = derivedImages_new;
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -1872,19 +2059,16 @@ const commandsModule = ({
               const sliceData = new_arrayBuffer.slice(i * scalarData.length, (i + 1) * scalarData.length);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(sliceData);
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              merged_derivedImages.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
           }
 
           const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+          // Extract the referencedImageIds from the derived images - this ensures correct mapping even when flipped
+          const referencedImageIds = merged_derivedImages.map(image => image.referencedImageId);
 
           // Parse label information from metadata if available
           let labels = {};
@@ -1917,7 +2101,9 @@ const commandsModule = ({
               segmentIndex: segmentNumber,
               label: 'nnUNet Auto Segment',
               locked: false,
-              cachedStats: {},
+              cachedStats: {
+                algorithmType: currentDisplaySets.SeriesInstanceUID,  // Add this for matching
+              },
               active: true,
             };
           }
@@ -1932,7 +2118,7 @@ const commandsModule = ({
                   data: {
                     imageIds: derivedImageIds,
                     referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                    referencedImageIds: imageIds,
+                    referencedImageIds: referencedImageIds,
                   },
                 },
                 config: { segments },
@@ -1948,7 +2134,7 @@ const commandsModule = ({
                     [LABELMAP]: {
                       imageIds: derivedImageIds,
                       referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                      referencedImageIds: imageIds,
+                      referencedImageIds: referencedImageIds,
                     }
                   }
                 },
@@ -1961,28 +2147,57 @@ const commandsModule = ({
             segmentationId: segmentationId,
           });
 
-          // semi-hack: to render segmentation properly on the current image
-          let somewhereIndex = 0;
-          if (currentImageIdIndex === 0) {
-            somewhereIndex = 1;
-          }
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+          // Wait for segmentation to be properly processed before rendering
+          await new Promise(resolve => setTimeout(resolve, 100));
 
-          // Recover the visibility of the segments
-          for (let i = 0; i < representations.length; i++) {
-            const representation = representations[i];
-            const repSegments = Object.values(representation.segments);
-            if (repSegments.length > 0) {
-              for (let j = 0; j < repSegments.length; j++) {
-                const segment = repSegments[j];
-                servicesManager.services.segmentationService.setSegmentVisibility(activeViewportId, representation.segmentationId, segment.segmentIndex, segment.visible);
+          // semi-hack: to render segmentation properly on the current image
+          // Wrapped in try-catch to prevent rendering errors from breaking the workflow
+          try {
+            let somewhereIndex = 0;
+            if (currentImageIdIndex === 0) {
+              somewhereIndex = 1;
+            }
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay between renders
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+          } catch (renderError) {
+            console.warn('Segmentation rendering adjustment failed, but segmentation should still be visible:', renderError);
+          }
+
+          // Recover the visibility of the segments with error protection
+          try {
+            for (let i = 0; i < representations.length; i++) {
+              const representation = representations[i];
+              const repSegments = Object.values(representation.segments);
+              if (repSegments.length > 0) {
+                for (let j = 0; j < repSegments.length; j++) {
+                  const segment = repSegments[j];
+                  servicesManager.services.segmentationService.setSegmentVisibility(activeViewportId, representation.segmentationId, segment.segmentIndex, segment.visible);
+                }
               }
             }
+          } catch (visibilityError) {
+            console.warn('Failed to restore segment visibility, but segmentation should still be visible:', visibilityError);
           }
 
           const end = Date.now();
           console.log(`nnUNet Auto Segmentation - Time taken: ${(end - start)/1000} Seconds`);
+          
+          // Automatically save the segmentation as DICOM SEG without user prompt
+          try {
+            console.log('Auto-saving segmentation as DICOM SEG...');
+            const seriesDescription = `nnUNet Auto Segmentation - ${new Date().toLocaleString()}`;
+            await commandsManager.run('storeSegmentation', {
+              segmentationId: segmentationId,
+              defaultSeriesDescription: seriesDescription,
+              autoSave: true,
+            });
+            console.log('Segmentation auto-saved successfully');
+          } catch (error) {
+            console.warn('Failed to auto-save segmentation:', error);
+            // Don't throw - segmentation is already loaded in viewer, save failure shouldn't block workflow
+          }
+          
           return response;
         }
       } catch (error) {
@@ -2106,16 +2321,11 @@ const commandsModule = ({
               const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(mappedSliceData);
-                if (flipped) {
-                  z_range.push(derivedImages_new.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              derivedImages_new.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
             merged_derivedImages = derivedImages_new;
           } else {
             merged_derivedImages = segImageIds.map(imageId => cache.getImage(imageId));
@@ -2130,19 +2340,16 @@ const commandsModule = ({
               const mappedSliceData = sliceData.map(v => v >= 1 ? segmentNumber : 0);
               if (sliceData.some(v => v >= 1)) {
                 voxelManager.setScalarData(mappedSliceData);
-                if (flipped) {
-                  z_range.push(merged_derivedImages.length - i - 1);
-                } else {
-                  z_range.push(i);
-                }
+                // z_range tracks the actual slice index in the current array order
+                z_range.push(i);
               }
             }
-            if (flipped) {
-              merged_derivedImages.reverse();
-            }
+            // Do NOT reverse back - keep in flipped order so derived images match their data
           }
 
           const derivedImageIds = merged_derivedImages.map(image => image.imageId);
+          // Extract the referencedImageIds from the derived images - this ensures correct mapping even when flipped
+          const referencedImageIds = merged_derivedImages.map(image => image.referencedImageId);
 
           // Create segment configuration
           let segments: { [segmentIndex: string]: cstTypes.Segment } = { ...existingSegments };
@@ -2166,7 +2373,7 @@ const commandsModule = ({
                   data: {
                     imageIds: derivedImageIds,
                     referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                    referencedImageIds: imageIds,
+                    referencedImageIds: referencedImageIds,
                   },
                 },
                 config: { segments },
@@ -2182,7 +2389,7 @@ const commandsModule = ({
                     [LABELMAP]: {
                       imageIds: derivedImageIds,
                       referencedVolumeId: currentDisplaySets.displaySetInstanceUID,
-                      referencedImageIds: imageIds,
+                      referencedImageIds: referencedImageIds,
                     }
                   }
                 },
@@ -2195,13 +2402,22 @@ const commandsModule = ({
             segmentationId: segmentationId,
           });
 
+          // Wait for segmentation to be properly processed before rendering
+          await new Promise(resolve => setTimeout(resolve, 100));
+
           // Force re-render to show segmentation properly
-          let somewhereIndex = 0;
-          if (currentImageIdIndex === 0) {
-            somewhereIndex = 1;
+          // Wrapped in try-catch to prevent rendering errors from breaking the workflow
+          try {
+            let somewhereIndex = 0;
+            if (currentImageIdIndex === 0) {
+              somewhereIndex = 1;
+            }
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
+            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay between renders
+            await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
+          } catch (renderError) {
+            console.warn('Segmentation rendering adjustment failed, but segmentation should still be visible:', renderError);
           }
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(somewhereIndex);
-          await servicesManager.services.cornerstoneViewportService.getCornerstoneViewport(activeViewportId).setImageIdIndex(currentImageIdIndex);
 
           const end = Date.now();
           console.log(`nnUNet Init for Interactive - Time taken: ${(end - start)/1000} Seconds`);
@@ -2213,6 +2429,235 @@ const commandsModule = ({
       } catch (error) {
         console.error('nnUNet Init for Interactive error:', error);
         throw error;
+      }
+    },
+
+    /**
+     * Load existing segmentations from the server if they exist.
+     * Does NOT run auto-segmentation if none are found - just silently returns.
+     * Used on viewport initialization to automatically load cached segmentations.
+     */
+    async loadExistingSegmentations(options: {
+      studyInstanceUID: string,
+      seriesInstanceUID: string,
+      activeViewportId: string
+    }) {
+      const { studyInstanceUID, seriesInstanceUID, activeViewportId } = options;
+      
+      console.log('[loadExistingSegmentations] ========== CALLED ==========');
+      console.log('[loadExistingSegmentations] StudyUID:', studyInstanceUID);
+      console.log('[loadExistingSegmentations] SeriesUID:', seriesInstanceUID);
+      console.log('[loadExistingSegmentations] ViewportID:', activeViewportId);
+      console.log('[loadExistingSegmentations] Has loaded before?', nninterSessionState.hasSegmentationsLoaded(seriesInstanceUID));
+      
+      // Check if we've already loaded segmentations for this series to prevent infinite loops
+      if (nninterSessionState.hasSegmentationsLoaded(seriesInstanceUID)) {
+        console.log('[loadExistingSegmentations] Already loaded for series, skipping:', seriesInstanceUID);
+        return;
+      }
+      
+      // Mark as loaded immediately to prevent re-entry
+      nninterSessionState.markSegmentationsLoaded(seriesInstanceUID);
+      console.log('[loadExistingSegmentations] Marked as loaded for series:', seriesInstanceUID);
+      
+      try {
+        console.log('[loadExistingSegmentations] Starting - StudyUID:', studyInstanceUID, 'SeriesUID:', seriesInstanceUID);
+        
+        // Force refresh metadata to discover new DICOM SEG files that were saved since study was opened
+        const dataSource = extensionManager.getActiveDataSource()[0];
+        console.log('[loadExistingSegmentations] Force refreshing metadata for study to discover new SEGs...');
+        
+        // Always fetch fresh metadata, bypassing the activeDisplaySets check
+        try {
+          await dataSource.retrieve.series.metadata({ 
+            StudyInstanceUID: studyInstanceUID, 
+            madeInClient: false 
+          });
+        } catch (metadataError) {
+          console.warn('[loadExistingSegmentations] Metadata refresh failed, continuing with cached data:', metadataError);
+        }
+        
+        // Wait a bit for display sets to be created
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Now get ALL display sets from the cache
+        const displaySetCache = displaySetService.getDisplaySetCache();
+        const allDisplaySets = Array.from(displaySetCache.values());
+        
+        // Debug logging
+        console.log('[loadExistingSegmentations] Total display sets in cache:', allDisplaySets.length);
+        console.log('[loadExistingSegmentations] Display sets:', allDisplaySets.map(ds => ({
+          Modality: ds.Modality,
+          StudyInstanceUID: ds.StudyInstanceUID,
+          SeriesInstanceUID: ds.SeriesInstanceUID,
+          SeriesDescription: ds.SeriesDescription,
+          displaySetInstanceUID: ds.displaySetInstanceUID
+        })));
+        
+        console.log('[loadExistingSegmentations] Looking for SEGs referencing series:', seriesInstanceUID);
+        
+        // Debug: Show all SEG display sets in the study
+        const allSEGsInStudy = allDisplaySets.filter(ds => 
+          ds.Modality === 'SEG' && 
+          ds.StudyInstanceUID === studyInstanceUID
+        );
+        console.log('[loadExistingSegmentations] All SEG display sets in study:', allSEGsInStudy.map(ds => ({
+          SeriesInstanceUID: ds.SeriesInstanceUID,
+          referencedSeriesInstanceUID: ds.referencedSeriesInstanceUID,
+          SeriesDescription: ds.SeriesDescription,
+          displaySetInstanceUID: ds.displaySetInstanceUID
+        })));
+        
+        // Look for any SEG modality that references this specific series
+        const existingSegmentations = allDisplaySets.filter(ds => 
+          ds.Modality === 'SEG' && 
+          ds.StudyInstanceUID === studyInstanceUID &&
+          ds.referencedSeriesInstanceUID === seriesInstanceUID
+        );
+        
+        console.log(`[loadExistingSegmentations] Found ${existingSegmentations.length} SEG display sets for series ${seriesInstanceUID}`);
+
+        if (existingSegmentations.length > 0) {
+          // Sort by creation time to get the most recent
+          const mostRecentSeg = existingSegmentations.sort((a, b) => {
+            const timeA = a.SeriesTime || a.SeriesDate || '000000';
+            const timeB = b.SeriesTime || b.SeriesDate || '000000';
+            return timeB.localeCompare(timeA);
+          })[0];
+          
+          console.log('[loadExistingSegmentations] Loading existing segmentation:', mostRecentSeg.SeriesDescription);
+          console.log('[loadExistingSegmentations] SEG displaySetInstanceUID:', mostRecentSeg.displaySetInstanceUID);
+          console.log('[loadExistingSegmentations] Target viewport:', activeViewportId);
+          
+          // Load the existing segmentation
+          uiNotificationService.show({
+            title: 'Loading Cached Segmentation',
+            message: `Loading: ${mostRecentSeg.SeriesDescription}`,
+            type: 'info',
+            duration: 3000,
+          });
+
+          try {
+            // Use the existing command to load the found segmentation
+            await commandsManager.run('loadSegmentationDisplaySetsForViewport', {
+              viewportId: activeViewportId,
+              displaySetInstanceUIDs: [mostRecentSeg.displaySetInstanceUID],
+            });
+
+            console.log('[loadExistingSegmentations] Segmentation loaded successfully');
+          } catch (loadError) {
+            console.error('[loadExistingSegmentations] Failed to load segmentation:', loadError);
+            uiNotificationService.show({
+              title: 'Error Loading Segmentation',
+              message: `Failed to load segmentation: ${loadError.message}`,
+              type: 'error',
+              duration: 5000,
+            });
+          }
+        } else {
+          console.log('[loadExistingSegmentations] No existing segmentations found - user can manually run auto-segmentation if needed');
+        }
+
+      } catch (error) {
+        console.error('[loadExistingSegmentations] Error loading segmentations:', error);
+      }
+    },
+
+    /**
+     * Reset the nninter session state for a specific series.
+     * This is called when a viewport is unmounted to ensure that when the user
+     * returns to the study, segmentations will be loaded again.
+     */
+    resetNninterSessionState(options: { seriesInstanceUID: string }) {
+      const { seriesInstanceUID } = options;
+      console.log('[resetNninterSessionState] ========== RESETTING STATE ==========');
+      console.log('[resetNninterSessionState] Clearing state for series:', seriesInstanceUID);
+      nninterSessionState.reset(seriesInstanceUID);
+      console.log('[resetNninterSessionState] State cleared successfully');
+    },
+
+    /**
+     * Check if auto-segmentation already exists for this study. If not, run it.
+     * If it exists, load it instead of running auto-segmentation again.
+     */
+    async checkAndRunAutoSegmentation(options: {
+      studyInstanceUID: string,
+      seriesInstanceUID: string,
+      activeViewportId: string
+    }) {
+      const { studyInstanceUID, seriesInstanceUID, activeViewportId } = options;
+      
+      // Check if already ran for this series
+      if (nninterSessionState.hasAutoSegmentationRan(seriesInstanceUID)) {
+        console.log(`[checkAndRunAutoSegmentation] Skipping - already ran for series: ${seriesInstanceUID}`);
+        return;
+      }
+      
+      try {
+        // Check for any existing cached segmentations in the study
+        const allDisplaySets = displaySetService.getActiveDisplaySets();
+        
+        // Debug: log all display sets to see what's available
+        console.log('[checkAndRunAutoSegmentation] All display sets:', allDisplaySets.map(ds => ({
+          Modality: ds.Modality,
+          StudyInstanceUID: ds.StudyInstanceUID,
+          SeriesDescription: ds.SeriesDescription,
+          displaySetInstanceUID: ds.displaySetInstanceUID
+        })));
+        
+        // Look for any SEG modality in the study (broader search)
+        const existingSegmentations = allDisplaySets.filter(ds => 
+          ds.Modality === 'SEG' && 
+          ds.StudyInstanceUID === studyInstanceUID
+        );
+        
+        console.log(`[checkAndRunAutoSegmentation] Found ${existingSegmentations.length} SEG display sets for study ${studyInstanceUID}`);
+
+        if (existingSegmentations.length > 0) {
+          // Sort by creation time to get the most recent
+          const mostRecentSeg = existingSegmentations.sort((a, b) => {
+            const timeA = a.SeriesTime || a.SeriesDate || '000000';
+            const timeB = b.SeriesTime || b.SeriesDate || '000000';
+            return timeB.localeCompare(timeA);
+          })[0];
+          
+          console.log('[checkAndRunAutoSegmentation] Found existing cached segmentation, loading...', mostRecentSeg.SeriesDescription);
+          
+          // Mark as ran since we found existing segmentation
+          nninterSessionState.markAutoSegmentationRan(seriesInstanceUID);
+          
+          // Load the existing segmentation
+          uiNotificationService.show({
+            title: 'Loading Cached Segmentation',
+            message: `Loading recent segmentation: ${mostRecentSeg.SeriesDescription}`,
+            type: 'info',
+            duration: 3000,
+          });
+
+          // Use the existing command to load the found segmentation
+          await commandsManager.run('loadSegmentationDisplaySetsForViewport', {
+            viewportId: activeViewportId,
+            displaySetInstanceUIDs: [mostRecentSeg.displaySetInstanceUID],
+          });
+
+          console.log('[checkAndRunAutoSegmentation] Existing cached segmentation loaded successfully');
+          
+        } else {
+          console.log('[checkAndRunAutoSegmentation] No existing cached segmentation found, running nnUNet auto-segmentation...');
+          
+          // Mark as ran before running
+          nninterSessionState.markAutoSegmentationRan(seriesInstanceUID);
+          
+          // Run new auto-segmentation since no cached segmentation exists
+          await commandsManager.run('nnunetAutoSegmentation', {});
+        }
+
+      } catch (error) {
+        console.error('[checkAndRunAutoSegmentation] Error:', error);
+        // If check fails, fall back to running auto-segmentation
+        console.log('[checkAndRunAutoSegmentation] Falling back to running new auto-segmentation...');
+        nninterSessionState.markAutoSegmentationRan(seriesInstanceUID);
+        await commandsManager.run('nnunetAutoSegmentation', {});
       }
     },
 
@@ -2765,10 +3210,13 @@ const commandsModule = ({
     sam2: actions.sam2,
     initNninter: actions.initNninter,
     resetNninter: actions.resetNninter,
+    resetNninterSessionState: actions.resetNninterSessionState,
     nninter: actions.nninter,
     jumpToSegment: actions.jumpToSegment,
     toggleCurrentSegment: actions.toggleCurrentSegment,
     nnunetAutoSegmentation: actions.nnunetAutoSegmentation,
+    loadExistingSegmentations: actions.loadExistingSegmentations,
+    checkAndRunAutoSegmentation: actions.checkAndRunAutoSegmentation,
     nnunetInitForInteractive: actions.nnunetInitForInteractive,
     calculateVolumetrics: actions.calculateVolumetrics,
     saveSegmentationToOrthanc: actions.saveSegmentationToOrthanc,
