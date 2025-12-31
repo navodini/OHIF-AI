@@ -1,4 +1,6 @@
 import { utils, Types, DicomMetadataStore } from '@ohif/core';
+import html2canvas from 'html2canvas';
+import dcmjs from 'dcmjs';
 
 import { ContextMenuController } from './CustomizableContextMenu';
 import DicomTagBrowser from './DicomTagBrowser/DicomTagBrowser';
@@ -2554,6 +2556,122 @@ const commandsModule = ({
         naturalizedReport.wadoRoot = dataSourceConfig.getConfig().wadoRoot;
         DicomMetadataStore.addInstances([naturalizedReport], true);
 
+        // Capture and save viewport screenshot as Secondary Capture
+        try {
+          // Get the viewport element for the active viewport
+          const viewportElement = document.querySelector(`[data-viewport-uid="${activeViewportId}"]`) as HTMLElement;
+          
+          if (viewportElement) {
+            console.log('Capturing viewport screenshot...');
+            const canvas = await html2canvas(viewportElement, {
+              useCORS: true,
+              allowTaint: true,
+              backgroundColor: '#000000',
+            });
+            
+            // Get image data from canvas
+            const imageWidth = canvas.width;
+            const imageHeight = canvas.height;
+            const ctx = canvas.getContext('2d');
+            const imageData = ctx?.getImageData(0, 0, imageWidth, imageHeight);
+            
+            if (imageData) {
+              // Convert to RGB pixel data (8-bit)
+              const rgbData = new Uint8Array(imageWidth * imageHeight * 3);
+              for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 3) {
+                rgbData[j] = imageData.data[i];       // R
+                rgbData[j + 1] = imageData.data[i + 1]; // G
+                rgbData[j + 2] = imageData.data[i + 2]; // B
+              }
+              
+              // Create DICOM Secondary Capture dataset
+              const now = new Date();
+              const dateStr = now.toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+              const timeStr = now.toISOString().slice(11, 19).replace(/:/g, ''); // HHMMSS
+              
+              // Generate unique UIDs
+              const scSeriesInstanceUID = dcmjs.data.DicomMetaDictionary.uid();
+              const scSOPInstanceUID = dcmjs.data.DicomMetaDictionary.uid();
+              
+              const screenshotDescription = `Screenshot - ${seriesDescription}`;
+              
+              const scDataset = {
+                _vrMap: {},
+                _meta: {
+                  MediaStorageSOPClassUID: '1.2.840.10008.5.1.4.1.1.7.4', // Multi-frame True Color Secondary Capture
+                  MediaStorageSOPInstanceUID: scSOPInstanceUID,
+                  TransferSyntaxUID: '1.2.840.10008.1.2.1', // Explicit VR Little Endian
+                },
+                // Patient Module
+                PatientName: naturalizedReport.PatientName,
+                PatientID: naturalizedReport.PatientID,
+                PatientBirthDate: naturalizedReport.PatientBirthDate || '',
+                PatientSex: naturalizedReport.PatientSex || '',
+                
+                // General Study Module
+                StudyInstanceUID: studyInstanceUID,
+                StudyDate: naturalizedReport.StudyDate || dateStr,
+                StudyTime: naturalizedReport.StudyTime || timeStr,
+                AccessionNumber: naturalizedReport.AccessionNumber || '',
+                ReferringPhysicianName: naturalizedReport.ReferringPhysicianName || '',
+                StudyID: naturalizedReport.StudyID || '',
+                
+                // General Series Module  
+                SeriesInstanceUID: scSeriesInstanceUID,
+                SeriesNumber: '999',
+                SeriesDate: dateStr,
+                SeriesTime: timeStr,
+                Modality: 'SC',
+                SeriesDescription: screenshotDescription,
+                
+                // SC Equipment Module
+                ConversionType: 'WSD', // Workstation
+                
+                // General Image Module
+                InstanceNumber: '1',
+                ContentDate: dateStr,
+                ContentTime: timeStr,
+                
+                // Image Pixel Module
+                SamplesPerPixel: 3,
+                PhotometricInterpretation: 'RGB',
+                Rows: imageHeight,
+                Columns: imageWidth,
+                BitsAllocated: 8,
+                BitsStored: 8,
+                HighBit: 7,
+                PixelRepresentation: 0,
+                PlanarConfiguration: 0,
+                PixelData: rgbData.buffer,
+                
+                // SOP Common Module
+                SOPClassUID: '1.2.840.10008.5.1.4.1.1.7.4', // Multi-frame True Color Secondary Capture
+                SOPInstanceUID: scSOPInstanceUID,
+              };
+              
+              console.log('Saving screenshot as Secondary Capture:', {
+                SeriesDescription: screenshotDescription,
+                SeriesInstanceUID: scSeriesInstanceUID,
+                SOPInstanceUID: scSOPInstanceUID,
+                imageSize: `${imageWidth}x${imageHeight}`,
+              });
+              
+              // Store the Secondary Capture to Orthanc
+              await dataSourceConfig.store.dicom(scDataset);
+              
+              // Note: We don't add SC to DicomMetadataStore as it causes issues
+              // The SC will be available on next study load from Orthanc
+              
+              console.log('Screenshot saved successfully');
+            }
+          } else {
+            console.log('Viewport element not found for screenshot capture');
+          }
+        } catch (screenshotError) {
+          console.error('Error capturing/saving screenshot:', screenshotError);
+          // Don't fail the whole operation if screenshot fails
+        }
+
         uiNotificationService.show({
           title: 'Segmentation Saved',
           message: `Saved: ${seriesDescription}`,
@@ -2570,6 +2688,212 @@ const commandsModule = ({
           duration: 5000,
         });
         console.error('Save segmentation error:', error);
+      }
+    },
+
+    /**
+     * Save just a screenshot of the current viewport as a DICOM Secondary Capture.
+     * Does not save segmentation - only captures the current view.
+     */
+    async saveScreenshotToOrthanc() {
+      const { activeViewportId, viewports } = viewportGridService.getState();
+      
+      try {
+        // Get study info from the active viewport's display set
+        const activeViewport = viewports.get(activeViewportId);
+        let studyInstanceUID = '';
+        let studyDateStr = '';
+        let patientName = '';
+        let patientID = '';
+        let patientBirthDate = '';
+        let patientSex = '';
+        let studyDate = '';
+        let studyTime = '';
+        let accessionNumber = '';
+        let referringPhysicianName = '';
+        let studyID = '';
+        
+        if (activeViewport && activeViewport.displaySetInstanceUIDs?.length > 0) {
+          const displaySetUID = activeViewport.displaySetInstanceUIDs[0];
+          const displaySet = displaySetService.getDisplaySetByUID(displaySetUID);
+          
+          if (displaySet) {
+            studyInstanceUID = displaySet.StudyInstanceUID || '';
+            
+            // Get metadata from the first instance
+            const instance = displaySet.instance || (displaySet.instances && displaySet.instances[0]);
+            
+            if (instance) {
+              // Get patient info from instance
+              patientName = instance.PatientName || '';
+              patientID = instance.PatientID || '';
+              patientBirthDate = instance.PatientBirthDate || '';
+              patientSex = instance.PatientSex || '';
+              
+              // Get study info from instance
+              studyDate = instance.StudyDate || '';
+              studyTime = instance.StudyTime || '';
+              accessionNumber = instance.AccessionNumber || '';
+              referringPhysicianName = instance.ReferringPhysicianName || '';
+              studyID = instance.StudyID || '';
+            }
+            
+            if (studyDate && studyDate.length === 8) {
+              studyDateStr = `${studyDate.slice(0, 4)}-${studyDate.slice(4, 6)}-${studyDate.slice(6, 8)}`;
+            }
+          }
+        }
+        
+        if (!studyInstanceUID) {
+          uiNotificationService.show({
+            title: 'Save Screenshot',
+            message: 'No study found in active viewport.',
+            type: 'warning',
+            duration: 4000,
+          });
+          return;
+        }
+        
+        // Get the viewport element
+        const viewportElement = document.querySelector(`[data-viewport-uid="${activeViewportId}"]`) as HTMLElement;
+        
+        if (!viewportElement) {
+          uiNotificationService.show({
+            title: 'Save Screenshot',
+            message: 'Could not find viewport to capture.',
+            type: 'error',
+            duration: 4000,
+          });
+          return;
+        }
+        
+        console.log('Capturing viewport screenshot...');
+        const canvas = await html2canvas(viewportElement, {
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: '#000000',
+        });
+        
+        // Get image data from canvas
+        const imageWidth = canvas.width;
+        const imageHeight = canvas.height;
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx?.getImageData(0, 0, imageWidth, imageHeight);
+        
+        if (!imageData) {
+          throw new Error('Failed to capture viewport image');
+        }
+        
+        // Convert to RGB pixel data (8-bit)
+        const rgbData = new Uint8Array(imageWidth * imageHeight * 3);
+        for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 3) {
+          rgbData[j] = imageData.data[i];       // R
+          rgbData[j + 1] = imageData.data[i + 1]; // G
+          rgbData[j + 2] = imageData.data[i + 2]; // B
+        }
+        
+        // Create DICOM Secondary Capture dataset
+        const now = new Date();
+        const dateStr = now.toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+        const timeStr = now.toISOString().slice(11, 19).replace(/:/g, ''); // HHMMSS
+        
+        // Generate unique UIDs
+        const scSeriesInstanceUID = dcmjs.data.DicomMetaDictionary.uid();
+        const scSOPInstanceUID = dcmjs.data.DicomMetaDictionary.uid();
+        
+        const screenshotDescription = `Screenshot - ${studyDateStr || dateStr}`;
+        
+        const scDataset = {
+          _vrMap: {},
+          _meta: {
+            MediaStorageSOPClassUID: '1.2.840.10008.5.1.4.1.1.7.4', // Multi-frame True Color Secondary Capture
+            MediaStorageSOPInstanceUID: scSOPInstanceUID,
+            TransferSyntaxUID: '1.2.840.10008.1.2.1', // Explicit VR Little Endian
+          },
+          // Patient Module
+          PatientName: patientName,
+          PatientID: patientID,
+          PatientBirthDate: patientBirthDate,
+          PatientSex: patientSex,
+          
+          // General Study Module
+          StudyInstanceUID: studyInstanceUID,
+          StudyDate: studyDate || dateStr,
+          StudyTime: studyTime || timeStr,
+          AccessionNumber: accessionNumber,
+          ReferringPhysicianName: referringPhysicianName,
+          StudyID: studyID,
+          
+          // General Series Module  
+          SeriesInstanceUID: scSeriesInstanceUID,
+          SeriesNumber: '999',
+          SeriesDate: dateStr,
+          SeriesTime: timeStr,
+          Modality: 'SC',
+          SeriesDescription: screenshotDescription,
+          
+          // SC Equipment Module
+          ConversionType: 'WSD', // Workstation
+          
+          // General Image Module
+          InstanceNumber: '1',
+          ContentDate: dateStr,
+          ContentTime: timeStr,
+          
+          // Image Pixel Module
+          SamplesPerPixel: 3,
+          PhotometricInterpretation: 'RGB',
+          Rows: imageHeight,
+          Columns: imageWidth,
+          BitsAllocated: 8,
+          BitsStored: 8,
+          HighBit: 7,
+          PixelRepresentation: 0,
+          PlanarConfiguration: 0,
+          PixelData: rgbData.buffer,
+          
+          // SOP Common Module
+          SOPClassUID: '1.2.840.10008.5.1.4.1.1.7.4', // Multi-frame True Color Secondary Capture
+          SOPInstanceUID: scSOPInstanceUID,
+        };
+        
+        console.log('Saving screenshot as Secondary Capture:', {
+          SeriesDescription: screenshotDescription,
+          SeriesInstanceUID: scSeriesInstanceUID,
+          SOPInstanceUID: scSOPInstanceUID,
+          imageSize: `${imageWidth}x${imageHeight}`,
+        });
+        
+        // Get the active data source to store
+        const dataSource = extensionManager.getActiveDataSource();
+        let dataSourceConfig = dataSource;
+        
+        if (dataSourceConfig.store === undefined) {
+          dataSourceConfig = dataSourceConfig[0];
+        }
+        
+        // Store the Secondary Capture to Orthanc
+        await dataSourceConfig.store.dicom(scDataset);
+        
+        // Note: We don't add SC to DicomMetadataStore as it causes issues
+        // The SC will be available on next study load from Orthanc
+        
+        uiNotificationService.show({
+          title: 'Screenshot Saved',
+          message: `Saved: ${screenshotDescription}`,
+          type: 'success',
+          duration: 4000,
+        });
+        
+        console.log('Screenshot saved successfully');
+      } catch (error: any) {
+        uiNotificationService.show({
+          title: 'Save Screenshot Failed',
+          message: error.message || 'Failed to save screenshot',
+          type: 'error',
+          duration: 5000,
+        });
+        console.error('Save screenshot error:', error);
       }
     },
 
@@ -2732,6 +3056,7 @@ const commandsModule = ({
     nnunetInitForInteractive: actions.nnunetInitForInteractive,
     calculateVolumetrics: actions.calculateVolumetrics,
     saveSegmentationToOrthanc: actions.saveSegmentationToOrthanc,
+    saveScreenshotToOrthanc: actions.saveScreenshotToOrthanc,
     updateViewportDisplaySet: actions.updateViewportDisplaySet,
   };
 

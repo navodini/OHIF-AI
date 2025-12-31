@@ -163,6 +163,7 @@ function modeFactory({ modeConfiguration }) {
         'calculateVolume',
         'longitudinalVolumetrics',
         'saveSegmentation',
+        'saveScreenshot',
         //'resetNninter',
         //'jumpToSegment',
         //'toggleCurrentSegment',
@@ -277,12 +278,20 @@ function modeFactory({ modeConfiguration }) {
           console.error('Failed to auto-load SEG:', errorMessage);
           console.error('Full error:', error);
           
+          // Provide more specific error messages based on the error type
+          let userMessage = errorMessage;
+          if (errorMessage.includes('orthogonal')) {
+            userMessage = 'Orientation mismatch detected. The segmentation was created in a different plane orientation than the original image acquisition. Try viewing in the same orientation as when the segmentation was created.';
+          } else if (errorMessage.includes('Perpendicular')) {
+            userMessage = 'The segmentation plane is perpendicular to the source image acquisition plane and cannot be loaded automatically.';
+          }
+          
           // Show notification to user about the loading failure
           uiNotificationService.show({
             title: 'Segmentation Load Issue',
-            message: `Could not load saved segmentation "${displaySet.SeriesDescription || 'Unknown'}". ${errorMessage.includes('orthogonal') ? 'Orientation mismatch detected.' : errorMessage}`,
+            message: `Could not load saved segmentation "${displaySet.SeriesDescription || 'Unknown'}". ${userMessage}`,
             type: 'warning',
-            duration: 5000,
+            duration: 8000,
           });
         }
       };

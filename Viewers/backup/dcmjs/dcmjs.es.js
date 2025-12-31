@@ -8841,6 +8841,11 @@ var DecimalString = /*#__PURE__*/function (_AsciiStringRepresent5) {
     key: "formatValue",
     value: function formatValue(value) {
       if (value === null) return "";
+      // FIX: Normalize very small values (like 3.86e-10) to 0 to avoid scientific notation
+      // corruption issues. Values smaller than 1e-9 are essentially 0 for medical imaging purposes.
+      if (typeof value === 'number' && Math.abs(value) < 1e-9) {
+        value = 0;
+      }
       var str = String(value);
       if (str.length > this.maxLength) {
         // Characters needed for '-' at start.

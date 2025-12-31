@@ -1138,8 +1138,6 @@ class BasicInferTask(InferTask):
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             final_result_json["label_name"] = f"nninter_pred_{timestamp}"
-
-            logger.info(f"final_result_json info: {final_result_json}")
             logger.info(f"just before pred and return: {time.time()-start} secs")
             
             # Cache segmentation for volumetric calculations
@@ -1410,8 +1408,6 @@ class BasicInferTask(InferTask):
                 final_result_json["label_name"] = f"sam3_pred_{timestamp}"
             else:
                 final_result_json["label_name"] = f"sam2_pred_{timestamp}"
-            
-            logger.info(f"Result json info: {final_result_json}")
             # result_json contains prompt information
 
             return pred, final_result_json

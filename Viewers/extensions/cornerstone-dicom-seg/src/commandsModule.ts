@@ -98,6 +98,43 @@ const commandsModule = ({
       const segImages = imageIds.map(imageId => cache.getImage(imageId));
       const referencedImages = segImages.map(image => cache.getImage(image.referencedImageId));
 
+      // DEBUG: Log segmentation generation info
+      console.log('[SEG generateSegmentation] Generating SEG:', {
+        segmentationId,
+        numSegImages: segImages.length,
+        numReferencedImages: referencedImages.length,
+        firstSegImageId: imageIds[0],
+        lastSegImageId: imageIds[imageIds.length - 1],
+        firstReferencedImageId: segImages[0]?.referencedImageId,
+        lastReferencedImageId: segImages[segImages.length - 1]?.referencedImageId,
+      });
+
+      // Log orientation info for first and last image
+      if (referencedImages[0] && referencedImages[referencedImages.length - 1]) {
+        const firstImagePlane = metaData.get('imagePlaneModule', segImages[0]?.referencedImageId);
+        const lastImagePlane = metaData.get('imagePlaneModule', segImages[segImages.length - 1]?.referencedImageId);
+        console.log('[SEG generateSegmentation] First referenced image orientation:', {
+          imageOrientationPatient: firstImagePlane?.imageOrientationPatient,
+          imagePositionPatient: firstImagePlane?.imagePositionPatient,
+        });
+        console.log('[SEG generateSegmentation] Last referenced image orientation:', {
+          imageOrientationPatient: lastImagePlane?.imageOrientationPatient,
+          imagePositionPatient: lastImagePlane?.imagePositionPatient,
+        });
+        
+        // Check if slices are in consistent order
+        if (firstImagePlane?.imagePositionPatient && lastImagePlane?.imagePositionPatient) {
+          const firstZ = firstImagePlane.imagePositionPatient[2];
+          const lastZ = lastImagePlane.imagePositionPatient[2];
+          console.log('[SEG generateSegmentation] Z-order check:', {
+            firstZ,
+            lastZ,
+            isAscending: firstZ < lastZ,
+            isDescending: firstZ > lastZ,
+          });
+        }
+      }
+
       const labelmaps2D = [];
 
       let z = 0;
@@ -250,6 +287,21 @@ const commandsModule = ({
       const { label } = segmentation;
       const defaultDataSource = dataSource ?? extensionManager.getActiveDataSource();
 
+      // Generate datetime stamp for default name (format: YYYY-MM-DD_HH-MM-SS)
+      const now = new Date();
+      const dateTimeStamp = now.toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-');
+      
+      // Clean up the base name - remove any existing random numbers like [7361]
+      let baseName = defaultSeriesDescription || label || 'Segmentation';
+      // Remove patterns like " [1234]" or "[1234]" from the name
+      baseName = baseName.replace(/\s*\[\d+\]\s*/g, '').trim();
+      // If baseName is empty after cleanup, default to 'Segmentation'
+      if (!baseName) {
+        baseName = 'Segmentation';
+      }
+      
+      const defaultNameWithTimestamp = `${baseName}_${dateTimeStamp}`;
+
       const {
         value: reportName,
         dataSourceName: selectedDataSource,
@@ -258,7 +310,7 @@ const commandsModule = ({
         servicesManager,
         extensionManager,
         title: 'Store Segmentation',
-        defaultValue: defaultSeriesDescription || label || '',
+        defaultValue: defaultNameWithTimestamp,
       });
 
       if (action === PROMPT_RESPONSES.CREATE_REPORT) {
@@ -267,10 +319,11 @@ const commandsModule = ({
             ? extensionManager.getDataSources(selectedDataSource)[0]
             : defaultDataSource;
 
+          console.log('[storeSegmentation] Generating segmentation for storage...');
           const generatedData = actions.generateSegmentation({
             segmentationId,
             options: {
-              SeriesDescription: reportName || label || 'Research Derived Series',
+              SeriesDescription: reportName || defaultNameWithTimestamp || 'Research Derived Series',
             },
           });
 
@@ -279,6 +332,16 @@ const commandsModule = ({
           }
 
           const { dataset: naturalizedReport } = generatedData;
+          
+          // Log key DICOM fields for debugging
+          console.log('[storeSegmentation] Generated SEG dataset:', {
+            SOPInstanceUID: naturalizedReport.SOPInstanceUID,
+            SeriesInstanceUID: naturalizedReport.SeriesInstanceUID,
+            StudyInstanceUID: naturalizedReport.StudyInstanceUID,
+            SeriesDescription: naturalizedReport.SeriesDescription,
+            hasReferencedSeriesSequence: !!naturalizedReport.ReferencedSeriesSequence,
+          });
+          
           let selectedDataSourceConfig_new = undefined;
           if (selectedDataSourceConfig.store == undefined) {
             selectedDataSourceConfig_new = selectedDataSourceConfig[0];
@@ -286,16 +349,20 @@ const commandsModule = ({
             selectedDataSourceConfig_new = selectedDataSourceConfig;
           }
           
+          console.log('[storeSegmentation] Storing to data source...');
           await selectedDataSourceConfig_new.store.dicom(naturalizedReport);
+          console.log('[storeSegmentation] Stored successfully');
           
           // add the information for where we stored it to the instance as well
           naturalizedReport.wadoRoot = selectedDataSourceConfig_new.getConfig().wadoRoot;
 
+          console.log('[storeSegmentation] Adding to DicomMetadataStore...');
           DicomMetadataStore.addInstances([naturalizedReport], true);
+          console.log('[storeSegmentation] Added to DicomMetadataStore - SEG should now appear in study browser');
 
           return naturalizedReport;
         } catch (error) {
-          console.debug('Error storing segmentation:', error);
+          console.error('[storeSegmentation] Error storing segmentation:', error);
           throw error;
         }
       }

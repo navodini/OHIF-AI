@@ -662,6 +662,17 @@ const toolbarButtons: Button[] = [
     },
   },
   {
+    id: 'saveScreenshot',
+    uiType: 'ohif.toolBoxButton',
+    props: {
+      type: 'tool',
+      icon: 'tool-capture',
+      label: 'Save Screenshot',
+      tooltip: 'Save current viewport as DICOM Secondary Capture',
+      commands: 'saveScreenshotToOrthanc',
+    },
+  },
+  {
     id: 'sam2',
     uiType: 'ohif.toolBoxButton',
     props: {

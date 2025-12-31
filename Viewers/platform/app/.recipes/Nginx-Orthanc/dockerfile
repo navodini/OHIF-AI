@@ -72,6 +72,9 @@ COPY ./backup/esm/getOrCreateImageVolume.js /usr/src/app/node_modules/@cornersto
 COPY ./backup/esm/VoxelManager.js /usr/src/app/node_modules/@cornerstonejs/core/dist/esm/utilities/VoxelManager.js
 COPY ./backup/dcmjs/dcmjs.es.js /usr/src/app/node_modules/dcmjs/build/dcmjs.es.js
 
+# FIX: Copy patched checkOrientation.js to fix scientific notation corruption in SEG orientation values
+COPY ./backup/adapters/checkOrientation.js /usr/src/app/node_modules/@cornerstonejs/adapters/dist/esm/adapters/helpers/checkOrientation.js
+
 COPY ./backup/vtkjs/ImageMarchingSquares.js /usr/src/app/node_modules/@kitware/vtk.js/Filters/General/ImageMarchingSquares.js
 
 # Copy the rest of the application code

@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { useSystem } from '@ohif/core';
 import { Button, Icons } from '@ohif/ui-next';
-import { cache } from '@cornerstonejs/core';
+import { cache, imageLoader } from '@cornerstonejs/core';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
 
@@ -317,7 +317,7 @@ async function calculateVolumetricsForDisplaySet(
  * Panel component for longitudinal volumetrics tracking
  */
 function PanelLongitudinalVolumetrics() {
-  const { servicesManager, extensionManager } = useSystem();
+  const { servicesManager, extensionManager, commandsManager } = useSystem();
   const { 
     displaySetService, 
     segmentationService, 
@@ -769,7 +769,7 @@ function PanelLongitudinalVolumetrics() {
     }
   }, [viewportGridService, displaySetService]);
 
-  // Export report as PDF with viewport captures
+  // Export report as PDF with viewport captures - Compact one-page layout
   const exportToPDF = useCallback(async () => {
     if (!report) return;
 
@@ -778,213 +778,227 @@ function PanelLongitudinalVolumetrics() {
 
     try {
       const pdf = new jsPDF({
-        orientation: 'portrait',
+        orientation: 'portrait', // A4 Portrait
         unit: 'mm',
         format: 'a4',
       });
 
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 15;
+      const margin = 10;
       const contentWidth = pageWidth - 2 * margin;
+      const numColumns = 3;
+      const columnWidth = (contentWidth - (numColumns - 1) * 4) / numColumns; // 4mm gap between columns
+      const columnGap = 4;
+      
       let yPos = margin;
 
-      // Helper function to add new page if needed
-      const checkPageBreak = (requiredSpace: number) => {
-        if (yPos + requiredSpace > pageHeight - margin) {
-          pdf.addPage();
-          yPos = margin;
-        }
-      };
-
-      // Title
-      pdf.setFontSize(18);
+      // Title - compact
+      pdf.setFontSize(14);
       pdf.setFont('helvetica', 'bold');
       pdf.text('Longitudinal Volumetrics Report', pageWidth / 2, yPos, { align: 'center' });
-      yPos += 12;
+      yPos += 7;
 
-      // Patient Info
-      pdf.setFontSize(12);
+      // Patient Info - single line
+      pdf.setFontSize(9);
       pdf.setFont('helvetica', 'normal');
-      pdf.text(`Patient ID: ${report.patientId}`, margin, yPos);
-      yPos += 6;
-      pdf.text(`Patient Name: ${report.patientName}`, margin, yPos);
-      yPos += 6;
-      pdf.text(`Report Date: ${new Date().toLocaleDateString()}`, margin, yPos);
-      yPos += 6;
-      pdf.text(`Number of Timepoints: ${report.timepoints.length}`, margin, yPos);
-      yPos += 12;
+      const patientInfo = `Patient: ${report.patientName} (${report.patientId}) | Timepoints: ${report.timepoints.length} | Date: ${new Date().toLocaleDateString()}`;
+      pdf.text(patientInfo, pageWidth / 2, yPos, { align: 'center' });
+      yPos += 5;
 
       // Divider line
-      pdf.setDrawColor(100, 100, 100);
+      pdf.setDrawColor(150, 150, 150);
       pdf.line(margin, yPos, pageWidth - margin, yPos);
-      yPos += 8;
+      yPos += 4;
 
-      // Volume Changes Summary
+      // Volume Changes Summary - compact horizontal layout
       if (report.volumeChanges.length > 0) {
-        checkPageBreak(40);
-        pdf.setFontSize(14);
-        pdf.setFont('helvetica', 'bold');
-        pdf.text('Volume Changes Summary', margin, yPos);
-        yPos += 8;
-
         pdf.setFontSize(10);
+        pdf.setFont('helvetica', 'bold');
+        pdf.text('Volume Changes:', margin, yPos);
+        
+        pdf.setFontSize(8);
         pdf.setFont('helvetica', 'normal');
-
+        let xOffset = margin + 30;
+        
         for (const vc of report.volumeChanges) {
           if (!selectedSegments.includes(vc.label)) continue;
           
-          checkPageBreak(25);
-          pdf.setFont('helvetica', 'bold');
-          pdf.text(vc.label, margin, yPos);
-          yPos += 5;
-          pdf.setFont('helvetica', 'normal');
-
-          for (const change of vc.changes) {
-            checkPageBreak(6);
-            const changeText = `${formatDicomDate(change.fromDate)} → ${formatDicomDate(change.toDate)}: `;
-            const volumeText = `${change.fromVolume.toFixed(2)} ml → ${change.toVolume.toFixed(2)} ml `;
-            const percentText = `(${change.percentChange >= 0 ? '+' : ''}${change.percentChange.toFixed(1)}%)`;
-            pdf.text(`  ${changeText}${volumeText}${percentText}`, margin, yPos);
-            yPos += 5;
+          // Get the overall change (first to last)
+          if (vc.changes.length > 0) {
+            const firstChange = vc.changes[0];
+            const lastChange = vc.changes[vc.changes.length - 1];
+            const overallChange = lastChange.percentChange;
+            const changeColor = overallChange > 0 ? [220, 53, 69] : overallChange < 0 ? [40, 167, 69] : [108, 117, 125];
+            
+            const changeText = `${vc.label}: ${firstChange.fromVolume.toFixed(1)}→${lastChange.toVolume.toFixed(1)}ml (${overallChange >= 0 ? '+' : ''}${overallChange.toFixed(1)}%)`;
+            
+            if (xOffset + pdf.getTextWidth(changeText) > pageWidth - margin) {
+              yPos += 4;
+              xOffset = margin + 30;
+            }
+            
+            pdf.setTextColor(changeColor[0], changeColor[1], changeColor[2]);
+            pdf.text(changeText, xOffset, yPos);
+            pdf.setTextColor(0, 0, 0);
+            xOffset += pdf.getTextWidth(changeText) + 10;
           }
-          yPos += 3;
         }
-        yPos += 5;
+        yPos += 6;
       }
 
-      // Timepoints with screenshots
-      pdf.setFontSize(14);
-      pdf.setFont('helvetica', 'bold');
-      checkPageBreak(20);
-      pdf.text('Timepoint Details', margin, yPos);
-      yPos += 10;
+      // Divider
+      pdf.setDrawColor(200, 200, 200);
+      pdf.line(margin, yPos, pageWidth - margin, yPos);
+      yPos += 4;
 
+      // Calculate grid layout for timepoints
+      const startY = yPos;
+      const availableHeight = pageHeight - startY - 15; // Leave space for footer
+      const numTimepoints = report.timepoints.length;
+      const numRows = Math.ceil(numTimepoints / numColumns);
+      const cellHeight = Math.min(availableHeight / numRows, 55); // Max cell height
+      const imgHeight = cellHeight - 18; // Space for text
+      const imgWidth = Math.min(columnWidth - 4, imgHeight * 1.33); // Maintain aspect ratio
+
+      // Collect screenshots first
+      const screenshots: (string | null)[] = [];
       for (let i = 0; i < report.timepoints.length; i++) {
         const tp = report.timepoints[i];
+        setLoadingMessage(`Loading screenshot ${i + 1}/${report.timepoints.length}...`);
         
-        checkPageBreak(80);
+        let screenshot: string | null = null;
         
-        // Timepoint header
-        pdf.setFontSize(12);
-        pdf.setFont('helvetica', 'bold');
-        pdf.text(`Timepoint ${i + 1}: ${formatDicomDate(tp.studyDate)}`, margin, yPos);
-        yPos += 6;
-        
-        pdf.setFontSize(10);
-        pdf.setFont('helvetica', 'normal');
-        pdf.text(`Series: ${tp.seriesDescription}`, margin, yPos);
-        yPos += 5;
-        pdf.text(`Total Volume: ${tp.totalVolumeMl.toFixed(2)} ml`, margin, yPos);
-        yPos += 6;
-
-        // Segment volumes table
-        pdf.setFont('helvetica', 'bold');
-        pdf.text('Segment', margin, yPos);
-        pdf.text('Volume (ml)', margin + 60, yPos);
-        pdf.text('Voxel Count', margin + 100, yPos);
-        yPos += 5;
-        
-        pdf.setFont('helvetica', 'normal');
-        for (const seg of tp.segments) {
-          if (!selectedSegments.includes(seg.label)) continue;
-          checkPageBreak(6);
-          pdf.text(seg.label.substring(0, 25), margin, yPos);
-          pdf.text(seg.volumeMl.toFixed(4), margin + 60, yPos);
-          pdf.text(seg.voxelCount.toString(), margin + 100, yPos);
-          yPos += 5;
-        }
-        
-        // Try to capture viewport screenshot
-        setLoadingMessage(`Capturing screenshot for timepoint ${i + 1}...`);
-        const screenshot = await captureViewportScreenshot(tp.displaySetInstanceUID);
-        
-        if (screenshot) {
-          checkPageBreak(70);
-          yPos += 3;
+        // Try to find Secondary Capture
+        try {
+          const allDisplaySets = displaySetService.getActiveDisplaySets();
+          const scDisplaySets = allDisplaySets.filter((ds: any) => 
+            ds.Modality === 'SC' && 
+            ds.StudyInstanceUID === tp.studyInstanceUID &&
+            ds.SeriesDescription?.includes('Screenshot')
+          );
           
-          // Add screenshot to PDF
-          const imgWidth = contentWidth * 0.7;
-          const imgHeight = imgWidth * 0.75; // Approximate aspect ratio
-          const imgX = margin + (contentWidth - imgWidth) / 2;
+          const matchingSC = scDisplaySets.find((sc: any) => 
+            sc.SeriesDescription?.includes(tp.seriesDescription) ||
+            sc.SeriesDescription?.includes(tp.studyDate)
+          );
           
-          try {
-            pdf.addImage(screenshot, 'PNG', imgX, yPos, imgWidth, imgHeight);
-            yPos += imgHeight + 5;
-          } catch (imgError) {
-            console.error('Error adding image to PDF:', imgError);
-            pdf.text('(Screenshot not available)', margin, yPos);
-            yPos += 5;
+          if (matchingSC && matchingSC.instances?.length > 0) {
+            const scInstance = matchingSC.instances[0] as any;
+            if (scInstance.imageId) {
+              try {
+                const imageData = await imageLoader.loadAndCacheImage(scInstance.imageId as string) as any;
+                if (imageData) {
+                  const tempCanvas = document.createElement('canvas');
+                  tempCanvas.width = imageData.columns || imageData.width;
+                  tempCanvas.height = imageData.rows || imageData.height;
+                  const tempCtx = tempCanvas.getContext('2d');
+                  if (tempCtx && imageData.getPixelData) {
+                    const pixelData = imageData.getPixelData();
+                    const imageDataObj = tempCtx.createImageData(tempCanvas.width, tempCanvas.height);
+                    if (imageData.color || imageData.rgba) {
+                      for (let j = 0, k = 0; j < pixelData.length; j += 3, k += 4) {
+                        imageDataObj.data[k] = pixelData[j];
+                        imageDataObj.data[k + 1] = pixelData[j + 1];
+                        imageDataObj.data[k + 2] = pixelData[j + 2];
+                        imageDataObj.data[k + 3] = 255;
+                      }
+                    } else {
+                      for (let j = 0, k = 0; j < pixelData.length; j++, k += 4) {
+                        imageDataObj.data[k] = pixelData[j];
+                        imageDataObj.data[k + 1] = pixelData[j];
+                        imageDataObj.data[k + 2] = pixelData[j];
+                        imageDataObj.data[k + 3] = 255;
+                      }
+                    }
+                    tempCtx.putImageData(imageDataObj, 0, 0);
+                    screenshot = tempCanvas.toDataURL('image/png');
+                  }
+                }
+              } catch (loadErr) {
+                console.log('Could not load SC image:', loadErr);
+              }
+            }
           }
+        } catch (scError) {
+          console.log('Error searching for Secondary Capture:', scError);
         }
         
-        yPos += 8;
-        
-        // Divider between timepoints
-        if (i < report.timepoints.length - 1) {
-          checkPageBreak(5);
-          pdf.setDrawColor(180, 180, 180);
-          pdf.line(margin, yPos, pageWidth - margin, yPos);
-          yPos += 8;
+        // Fallback to viewport screenshot
+        if (!screenshot) {
+          screenshot = await captureViewportScreenshot(tp.displaySetInstanceUID);
         }
+        
+        screenshots.push(screenshot);
       }
 
-      // Bar chart representation (simplified text version)
-      checkPageBreak(40);
-      pdf.addPage();
-      yPos = margin;
-      
-      pdf.setFontSize(14);
-      pdf.setFont('helvetica', 'bold');
-      pdf.text('Volume Trend Over Time', margin, yPos);
-      yPos += 10;
+      setLoadingMessage('Generating PDF layout...');
 
-      // Create a simple text-based volume chart
-      const uniqueLabels = Array.from(new Set(report.timepoints.flatMap(tp => tp.segments.map(s => s.label))))
-        .filter(label => selectedSegments.includes(label));
-
-      for (const label of uniqueLabels) {
-        checkPageBreak(25);
-        pdf.setFontSize(11);
-        pdf.setFont('helvetica', 'bold');
-        pdf.text(label, margin, yPos);
-        yPos += 6;
-
+      // Draw timepoints in grid
+      for (let i = 0; i < report.timepoints.length; i++) {
+        const tp = report.timepoints[i];
+        const row = Math.floor(i / numColumns);
+        const col = i % numColumns;
+        
+        // Check if we need a new page
+        if (row > 0 && row * cellHeight + startY > pageHeight - 20) {
+          pdf.addPage();
+          yPos = margin;
+        }
+        
+        const cellX = margin + col * (columnWidth + columnGap);
+        const cellY = startY + row * cellHeight;
+        
+        // Draw cell border (light gray)
+        pdf.setDrawColor(220, 220, 220);
+        pdf.setLineWidth(0.3);
+        pdf.rect(cellX, cellY, columnWidth, cellHeight - 2);
+        
+        // Timepoint header
         pdf.setFontSize(9);
+        pdf.setFont('helvetica', 'bold');
+        pdf.setTextColor(0, 0, 0);
+        pdf.text(`T${i + 1}: ${formatDicomDate(tp.studyDate)}`, cellX + 2, cellY + 4);
+        
+        // Volume info
+        pdf.setFontSize(7);
         pdf.setFont('helvetica', 'normal');
         
-        for (const tp of report.timepoints) {
-          const seg = tp.segments.find(s => s.label === label);
-          const volume = seg?.volumeMl || 0;
-          const barLength = Math.min((volume / 100) * contentWidth, contentWidth - 40);
-          
-          checkPageBreak(6);
-          pdf.text(formatDicomDate(tp.studyDate).substring(5), margin, yPos);
-          
-          // Draw bar
-          pdf.setFillColor(66, 135, 245);
-          pdf.rect(margin + 25, yPos - 3, barLength > 0 ? barLength : 1, 4, 'F');
-          
-          // Volume label
-          pdf.text(`${volume.toFixed(2)} ml`, margin + 30 + barLength, yPos);
-          yPos += 6;
+        // Show volumes for selected segments (compact)
+        let volY = cellY + 8;
+        for (const seg of tp.segments) {
+          if (!selectedSegments.includes(seg.label)) continue;
+          const volText = `${seg.label.substring(0, 12)}: ${seg.volumeMl.toFixed(2)}ml`;
+          pdf.text(volText, cellX + 2, volY);
+          volY += 3;
+          if (volY > cellY + 15) break; // Limit to 2-3 segments
         }
-        yPos += 5;
+        
+        // Add screenshot
+        const screenshot = screenshots[i];
+        if (screenshot) {
+          const imgX = cellX + (columnWidth - imgWidth) / 2;
+          const imgY = cellY + 16;
+          
+          try {
+            pdf.addImage(screenshot, 'PNG', imgX, imgY, imgWidth, imgHeight - 2);
+          } catch (imgError) {
+            pdf.setFontSize(6);
+            pdf.text('(No image)', cellX + columnWidth / 2, cellY + cellHeight / 2, { align: 'center' });
+          }
+        }
       }
 
       // Footer
-      const totalPages = pdf.getNumberOfPages();
-      for (let i = 1; i <= totalPages; i++) {
-        pdf.setPage(i);
-        pdf.setFontSize(8);
-        pdf.setFont('helvetica', 'normal');
-        pdf.text(
-          `Page ${i} of ${totalPages} | Generated by OHIF Viewer`,
-          pageWidth / 2,
-          pageHeight - 8,
-          { align: 'center' }
-        );
-      }
+      pdf.setFontSize(7);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setTextColor(128, 128, 128);
+      pdf.text(
+        `Generated by OHIF Viewer | ${new Date().toLocaleString()}`,
+        pageWidth / 2,
+        pageHeight - 5,
+        { align: 'center' }
+      );
 
       // Download PDF
       pdf.save(`volumetrics_report_${report.patientId}_${new Date().toISOString().split('T')[0]}.pdf`);
@@ -1218,25 +1232,28 @@ function PanelLongitudinalVolumetrics() {
             <div className="bg-gray-900 rounded p-3">
               <h3 className="text-sm font-medium text-gray-300 mb-3">Volume Over Time</h3>
               
-              {/* Get all unique segment labels across all timepoints */}
+              {/* Show a single line with total volume from the most recent segmentation per timepoint */}
               {(() => {
-                const allLabels = Array.from(new Set(report.timepoints.flatMap(tp => tp.segments.map(s => s.label))))
-                  .filter(label => selectedSegments.includes(label));
+                // Calculate total volume per timepoint (sum of all selected segments)
+                const timepointVolumes = report.timepoints.map(tp => {
+                  const selectedSegs = tp.segments.filter(s => selectedSegments.includes(s.label));
+                  const totalVolume = selectedSegs.reduce((sum, s) => sum + s.volumeMl, 0);
+                  return {
+                    date: tp.studyDate,
+                    volume: totalVolume,
+                    seriesDescription: tp.seriesDescription,
+                    displaySetInstanceUID: tp.displaySetInstanceUID,
+                  };
+                });
                 
-                // Calculate global max for consistent Y-axis across all segments
-                const allVolumes = allLabels.flatMap(label => 
-                  report.timepoints.map(tp => {
-                    const seg = tp.segments.find(s => s.label === label);
-                    return seg?.volumeMl || 0;
-                  })
-                );
-                const globalMaxVolume = Math.max(...allVolumes, 0.1);
+                // Calculate max volume for Y-axis
+                const maxVolume = Math.max(...timepointVolumes.map(tv => tv.volume), 0.1);
                 
                 // Generate Y-axis tick values (5 ticks)
-                const yTicks = [0, globalMaxVolume * 0.25, globalMaxVolume * 0.5, globalMaxVolume * 0.75, globalMaxVolume];
+                const yTicks = [0, maxVolume * 0.25, maxVolume * 0.5, maxVolume * 0.75, maxVolume];
                 
-                // Colors for different segments
-                const colors = ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4'];
+                // Chart color
+                const lineColor = '#3b82f6';
                 
                 const chartHeight = 140;
                 const chartWidth = 280;
@@ -1244,19 +1261,27 @@ function PanelLongitudinalVolumetrics() {
                 const plotWidth = chartWidth - padding.left - padding.right;
                 const plotHeight = chartHeight - padding.top - padding.bottom;
                 
+                // Create points for the single line
+                const points = timepointVolumes.map((tv, idx) => {
+                  const x = padding.left + (idx / Math.max(timepointVolumes.length - 1, 1)) * plotWidth;
+                  const y = padding.top + plotHeight - (tv.volume / maxVolume) * plotHeight;
+                  return { x, y, volume: tv.volume, date: formatDicomDate(tv.date) };
+                });
+                
+                // Create path for the line
+                const pathD = points.map((p, idx) => 
+                  `${idx === 0 ? 'M' : 'L'} ${p.x} ${p.y}`
+                ).join(' ');
+                
                 return (
                   <div className="mb-4">
                     {/* Legend */}
-                    <div className="flex flex-wrap gap-3 mb-3">
-                      {allLabels.map((label, idx) => (
-                        <div key={label} className="flex items-center gap-1">
-                          <div 
-                            className="w-3 h-3 rounded-full" 
-                            style={{ backgroundColor: colors[idx % colors.length] }}
-                          />
-                          <span className="text-xs text-gray-300">{label}</span>
-                        </div>
-                      ))}
+                    <div className="flex items-center gap-2 mb-3">
+                      <div 
+                        className="w-3 h-3 rounded-full" 
+                        style={{ backgroundColor: lineColor }}
+                      />
+                      <span className="text-xs text-gray-300">Total Volume (Selected Segments)</span>
                     </div>
                     
                     {/* SVG Line Chart */}
@@ -1267,7 +1292,7 @@ function PanelLongitudinalVolumetrics() {
                     >
                       {/* Y-axis grid lines and labels */}
                       {yTicks.map((tick, idx) => {
-                        const y = padding.top + plotHeight - (tick / globalMaxVolume) * plotHeight;
+                        const y = padding.top + plotHeight - (tick / maxVolume) * plotHeight;
                         return (
                           <g key={idx}>
                             <line 
@@ -1305,69 +1330,48 @@ function PanelLongitudinalVolumetrics() {
                       </text>
                       
                       {/* X-axis labels (dates) */}
-                      {report.timepoints.map((tp, idx) => {
-                        const x = padding.left + (idx / Math.max(report.timepoints.length - 1, 1)) * plotWidth;
+                      {timepointVolumes.map((tv, idx) => {
+                        const x = padding.left + (idx / Math.max(timepointVolumes.length - 1, 1)) * plotWidth;
                         return (
                           <text 
-                            key={tp.displaySetInstanceUID}
+                            key={tv.displaySetInstanceUID}
                             x={x} 
                             y={chartHeight - 5} 
                             textAnchor="middle" 
                             fill="#6b7280" 
                             fontSize="7"
                           >
-                            {formatDicomDate(tp.studyDate).substring(5)}
+                            {formatDicomDate(tv.date).substring(5)}
                           </text>
                         );
                       })}
                       
-                      {/* Lines and points for each segment */}
-                      {allLabels.map((segmentLabel, labelIdx) => {
-                        const color = colors[labelIdx % colors.length];
-                        const points = report.timepoints.map((tp, idx) => {
-                          const seg = tp.segments.find(s => s.label === segmentLabel);
-                          const volume = seg?.volumeMl || 0;
-                          const x = padding.left + (idx / Math.max(report.timepoints.length - 1, 1)) * plotWidth;
-                          const y = padding.top + plotHeight - (volume / globalMaxVolume) * plotHeight;
-                          return { x, y, volume, date: formatDicomDate(tp.studyDate) };
-                        });
-                        
-                        // Create path for the line
-                        const pathD = points.map((p, idx) => 
-                          `${idx === 0 ? 'M' : 'L'} ${p.x} ${p.y}`
-                        ).join(' ');
-                        
-                        return (
-                          <g key={segmentLabel}>
-                            {/* Line */}
-                            <path 
-                              d={pathD} 
-                              fill="none" 
-                              stroke={color} 
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            />
-                            
-                            {/* Data points */}
-                            {points.map((p, idx) => (
-                              <g key={idx}>
-                                <circle 
-                                  cx={p.x} 
-                                  cy={p.y} 
-                                  r="4" 
-                                  fill={color}
-                                  stroke="#1f2937"
-                                  strokeWidth="1"
-                                  className="cursor-pointer"
-                                />
-                                {/* Tooltip - shows on hover via CSS */}
-                                <title>{`${p.date}: ${p.volume.toFixed(2)} ml`}</title>
-                              </g>
-                            ))}
-                          </g>
-                        );
-                      })}
+                      {/* Single line for total volume */}
+                      <path 
+                        d={pathD} 
+                        fill="none" 
+                        stroke={lineColor} 
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                      
+                      {/* Data points */}
+                      {points.map((p, idx) => (
+                        <g key={idx}>
+                          <circle 
+                            cx={p.x} 
+                            cy={p.y} 
+                            r="4" 
+                            fill={lineColor}
+                            stroke="#1f2937"
+                            strokeWidth="1"
+                            className="cursor-pointer"
+                          />
+                          {/* Tooltip - shows on hover via CSS */}
+                          <title>{`${p.date}: ${p.volume.toFixed(2)} ml`}</title>
+                        </g>
+                      ))}
                     </svg>
                     
                     {/* X-axis label */}
